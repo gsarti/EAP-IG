@@ -123,7 +123,7 @@ def jvp_attention(
     if ln1_scale.ndim == 4:
         ln1_scale = ln1_scale[:, :, 0, :]  # identical across heads
     t_ln = tangent / ln1_scale.unsqueeze(1)  # (batch, 1, pos, 1)
-    if not cfg.fold_ln:
+    if hasattr(block.ln1, 'w'):
         t_ln = t_ln * block.ln1.w  # (d_model,)
 
     # --- Q, K, V projections ---
@@ -207,7 +207,7 @@ def jvp_mlp(
     # --- Frozen LN2 ---
     ln2_scale = cache[f'blocks.{layer_idx}.ln2.hook_scale']  # (batch, pos, 1)
     t_ln = tangent / ln2_scale.unsqueeze(1)
-    if not cfg.fold_ln:
+    if hasattr(block.ln2, 'w'):
         t_ln = t_ln * block.ln2.w
 
     if cfg.gated_mlp:
