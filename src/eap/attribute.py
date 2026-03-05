@@ -11,7 +11,10 @@ from tqdm import tqdm
 from .utils import tokenize_plus, make_hooks_and_matrices, compute_mean_activations
 from .evaluate import evaluate_graph, evaluate_baseline
 from .graph import Graph
-from .gwai import propagate, get_reference, compute_proximity_scores, make_names_filter
+from .gwai import (
+    compute_gradient_scores, compute_proximity_scores, make_names_filter,
+    _propagate_chunked_attention, _propagate_chunked_mlp,
+)
 
 
 def _model_device(model: HookedTransformer):
@@ -420,94 +423,143 @@ def get_scores_information_flow_routes(model: HookedTransformer, graph: Graph, d
     return scores
 
 def get_scores_gwai(model: HookedTransformer, graph: Graph, dataloader: DataLoader,
-                    k: int = 1, tsg_temperature: float = 2.0, scale_multiplicative: bool = True,
-                    renormalize: bool = True, chunk_size: int = 8, quiet: bool = False) -> torch.Tensor:
-    """Gets scores using GWAI: GIM-corrected ALTI with downstream look-ahead.
+                    metric: Callable[[Tensor], Tensor],
+                    scoring: Literal['gradient', 'proximity'] = 'gradient',
+                    incremental: bool = True,
+                    tsg_temperature: float = 2.0, scale_multiplicative: bool = True,
+                    chunk_size: int = 8, quiet: bool = False) -> torch.Tensor:
+    """Gets scores using GWAI: Gradient-Weighted ALTI Interactions.
 
-    For each edge, propagates the source node's activation through k subsequent
-    transformer layers using GIM-corrected JVPs (temperature-adjusted softmax,
-    frozen LayerNorm, Shapley gradient normalization), then scores using the ALTI
-    proximity metric at the downstream point.
+    Uses incremental propagation: source contributions are propagated through
+    each layer via GIM-corrected JVPs, and scored at each destination along the
+    way. Sources accumulate propagation through all layers from origin to
+    destination, naturally capturing self-repair effects.
 
-    k=0 recovers pure ALTI (information-flow-routes).
-    k=1 captures the dominant self-repair effects from the next layer.
-    k=2+ provides progressively more faithful attribution at higher cost.
+    Two scoring modes:
+      - 'gradient': projects each source's (propagated) contribution onto the
+        task gradient direction. Combines structural decomposition with task
+        awareness. Requires one backward pass per batch.
+      - 'proximity': ALTI proximity metric (geometric, task-agnostic).
+
+    When incremental=False, no JVP propagation is done (equivalent to pure ALTI
+    for proximity scoring, or gradient-weighted raw contributions for gradient
+    scoring).
 
     Args:
         model: the model to attribute
         graph: the graph to attribute
         dataloader: the data over which to attribute
-        k: number of look-ahead layers (0 = pure ALTI, 1+ = GWAI)
+        metric: the metric to attribute w.r.t. (needed for gradient scoring)
+        scoring: 'gradient' or 'proximity'
+        incremental: whether to propagate sources through layers via GIM JVPs
         tsg_temperature: temperature for TSG softmax correction (default 2.0)
         scale_multiplicative: whether to apply Shapley /2 at multiplicative junctions
-        renormalize: if True, use sum of propagated contributions as reference
-                     instead of actual downstream residual stream (recommended for k>0)
         chunk_size: number of source nodes to process simultaneously in JVP
-                    (reduce for long sequences or limited GPU memory)
         quiet: suppress tqdm output
 
     Returns:
         Tensor: a [src_nodes, dst_nodes] tensor of scores for each edge
     """
-    scores = torch.zeros((graph.n_forward, graph.n_backward), device=_model_device(model), dtype=model.cfg.dtype)
+    device = _model_device(model)
+    scores = torch.zeros((graph.n_forward, graph.n_backward), device=device, dtype=model.cfg.dtype)
 
-    names_filter = make_names_filter(model, k)
+    names_filter = make_names_filter(model, needs_jvp=incremental)
     n_layers = graph.cfg['n_layers']
     n_heads = graph.cfg['n_heads']
+    parallel = model.cfg.parallel_attn_mlp
 
     total_items = 0
-    dataloader = dataloader if quiet else tqdm(dataloader)
-    for clean, _, _ in dataloader:
+    dataloader_iter = dataloader if quiet else tqdm(dataloader)
+    for clean, corrupted, label in dataloader_iter:
         batch_size = len(clean)
         total_items += batch_size
         clean_tokens, attention_mask, input_lengths, n_pos = tokenize_plus(model, clean)
 
-        # Run forward pass and cache needed activations
+        # --- Forward pass and cache ---
         with torch.inference_mode():
             _, cache = model.run_with_cache(clean_tokens, attention_mask=attention_mask,
                                             names_filter=names_filter)
 
-        # Build source activations tensor: (batch, pos, n_forward, d_model)
-        source_acts = torch.zeros((batch_size, n_pos, graph.n_forward, model.cfg.d_model),
-                                  device=model.cfg.device, dtype=model.cfg.dtype)
+        # --- Compute task gradient at each residual stream point ---
+        # grad_at[layer] = gradient of metric w.r.t. resid_pre[layer]
+        # grad_at[n_layers] = gradient of metric w.r.t. resid_post[last_layer]
+        grad_at = {}
+        if scoring == 'gradient':
+            # Single backward pass to get gradients at all residual stream positions
+            resid_hooks = {}
+            for layer in range(n_layers):
+                resid_hooks[f'blocks.{layer}.hook_resid_pre'] = layer
+                if not parallel:
+                    resid_hooks[f'blocks.{layer}.hook_resid_mid'] = (layer, 'mid')
+            resid_hooks[f'blocks.{n_layers - 1}.hook_resid_post'] = n_layers
 
-        # Input embeddings
+            saved_resids = {}
+            def make_save_hook(key):
+                def hook_fn(activations, hook):
+                    activations.retain_grad()
+                    saved_resids[key] = activations
+                    return activations
+                return hook_fn
+
+            fwd_hooks = [(name, make_save_hook(key)) for name, key in resid_hooks.items()]
+
+            with model.hooks(fwd_hooks=fwd_hooks):
+                logits = model(clean_tokens, attention_mask=attention_mask)
+                clean_logits = logits.detach()
+                metric_value = metric(logits, clean_logits, input_lengths, label)
+                metric_value.backward()
+
+            for key, resid in saved_resids.items():
+                if resid.grad is not None:
+                    grad_at[key] = resid.grad.detach()
+                else:
+                    grad_at[key] = torch.zeros_like(resid)
+
+            # Clear grads
+            model.zero_grad()
+
+        # --- Build source activations: (batch, pos, n_forward, d_model) ---
+        source_acts = torch.zeros((batch_size, n_pos, graph.n_forward, model.cfg.d_model),
+                                  device=device, dtype=model.cfg.dtype)
         source_acts[:, :, 0] = cache['hook_embed']
 
         for layer in range(n_layers):
-            # Attention head outputs (per-head, already projected through W_O)
             attn_node = graph.nodes[f'a{layer}.h0']
-            fwd_idx = graph.forward_index(attn_node)  # slice for all heads
-            attn_result = cache[f'blocks.{layer}.attn.hook_result']  # (batch, pos, n_heads, d_model)
-            source_acts[:, :, fwd_idx] = attn_result
+            fwd_idx = graph.forward_index(attn_node)
+            source_acts[:, :, fwd_idx] = cache[f'blocks.{layer}.attn.hook_result']
 
-            # MLP output
             mlp_node = graph.nodes[f'm{layer}']
             mlp_fwd_idx = graph.forward_index(mlp_node, attn_slice=False)
             source_acts[:, :, mlp_fwd_idx] = cache[f'blocks.{layer}.hook_mlp_out']
 
-        # Score each destination node
+        # --- Incremental scoring ---
+        # Walk through layers. At each destination, score using current source_acts
+        # (which have been propagated through all prior layers if incremental=True).
+        # Then propagate source_acts through the current half-block.
         for layer in range(n_layers):
-            # --- Attention destinations (q, k, v) ---
             attn_node = graph.nodes[f'a{layer}.h0']
             prev_index = graph.prev_index(attn_node)
 
             if prev_index > 0:
-                contribs = source_acts[:, :, :prev_index]  # (batch, pos, n_src, d_model)
+                contribs = source_acts[:, :, :prev_index]
 
-                with torch.inference_mode():
-                    propagated = propagate(contribs, layer, 'attention', k, model, cache,
-                                           tsg_temperature, scale_multiplicative, chunk_size)
-                    reference = get_reference(layer, 'attention', k, model, cache)
+                if scoring == 'gradient' and layer in grad_at:
+                    importance = compute_gradient_scores(contribs, grad_at[layer], input_lengths)
+                else:
+                    ref = cache[f'blocks.{layer}.hook_resid_pre']
+                    importance = compute_proximity_scores(contribs, ref, input_lengths)
 
-                importance = compute_proximity_scores(
-                    propagated, reference, input_lengths, renormalize=(renormalize and k > 0)
-                )
-                # importance: (n_src,) — same for all heads and all qkv types
                 for letter in 'qkv':
                     bwd_idx = graph.backward_index(attn_node, qkv=letter)
-                    # bwd_idx is a slice for all heads; importance is per-source
                     scores[:prev_index, bwd_idx] += importance.unsqueeze(1).expand(-1, n_heads)
+
+            # Propagate all sources through attention of this layer
+            if incremental:
+                n_src_so_far = graph.prev_index(graph.nodes[f'm{layer}'])
+                with torch.inference_mode():
+                    source_acts = _propagate_chunked_attention(
+                        source_acts, n_src_so_far, layer, model, cache,
+                        tsg_temperature, scale_multiplicative, chunk_size)
 
             # --- MLP destination ---
             mlp_node = graph.nodes[f'm{layer}']
@@ -516,35 +568,49 @@ def get_scores_gwai(model: HookedTransformer, graph: Graph, dataloader: DataLoad
             if prev_index_mlp > 0:
                 contribs_mlp = source_acts[:, :, :prev_index_mlp]
 
-                with torch.inference_mode():
-                    propagated_mlp = propagate(contribs_mlp, layer, 'mlp', k, model, cache,
-                                               tsg_temperature, scale_multiplicative, chunk_size)
-                    reference_mlp = get_reference(layer, 'mlp', k, model, cache)
+                if scoring == 'gradient' and (layer, 'mid') in grad_at:
+                    importance_mlp = compute_gradient_scores(
+                        contribs_mlp, grad_at[(layer, 'mid')], input_lengths)
+                elif scoring == 'gradient' and layer in grad_at:
+                    # Parallel arch: use resid_pre grad for MLP too
+                    importance_mlp = compute_gradient_scores(
+                        contribs_mlp, grad_at[layer], input_lengths)
+                else:
+                    ref_mlp = (cache[f'blocks.{layer}.hook_resid_mid'] if not parallel
+                               else cache[f'blocks.{layer}.hook_resid_pre'])
+                    importance_mlp = compute_proximity_scores(
+                        contribs_mlp, ref_mlp, input_lengths)
 
-                importance_mlp = compute_proximity_scores(
-                    propagated_mlp, reference_mlp, input_lengths, renormalize=(renormalize and k > 0)
-                )
                 bwd_idx_mlp = graph.backward_index(mlp_node)
                 scores[:prev_index_mlp, bwd_idx_mlp] += importance_mlp
+
+            # Propagate all sources through MLP of this layer
+            if incremental:
+                n_src_after_mlp = graph.prev_index(
+                    graph.nodes[f'a{layer + 1}.h0'] if layer + 1 < n_layers
+                    else graph.nodes['logits'])
+                with torch.inference_mode():
+                    source_acts = _propagate_chunked_mlp(
+                        source_acts, n_src_after_mlp, layer, model, cache,
+                        scale_multiplicative, chunk_size)
 
         # --- Logits destination ---
         logit_node = graph.nodes['logits']
         prev_index_logits = graph.prev_index(logit_node)
         contribs_logits = source_acts[:, :, :prev_index_logits]
 
-        with torch.inference_mode():
-            propagated_logits = propagate(contribs_logits, n_layers, 'logits', k, model, cache,
-                                          tsg_temperature, scale_multiplicative, chunk_size)
-            reference_logits = get_reference(n_layers, 'logits', k, model, cache)
+        if scoring == 'gradient' and n_layers in grad_at:
+            importance_logits = compute_gradient_scores(
+                contribs_logits, grad_at[n_layers], input_lengths)
+        else:
+            ref_logits = cache[f'blocks.{n_layers - 1}.hook_resid_post']
+            importance_logits = compute_proximity_scores(
+                contribs_logits, ref_logits, input_lengths)
 
-        importance_logits = compute_proximity_scores(
-            propagated_logits, reference_logits, input_lengths, renormalize=(renormalize and k > 0)
-        )
         bwd_idx_logits = graph.backward_index(logit_node)
         scores[:prev_index_logits, bwd_idx_logits] += importance_logits
 
-        # Free cache memory
-        del cache
+        del cache, source_acts
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -557,8 +623,9 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
               method: Literal['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'GWAI', 'exact'],
               intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', aggregation='sum',
               ig_steps: Optional[int]=None, intervention_dataloader: Optional[DataLoader]=None, quiet=False,
-              gwai_k: int = 1, gwai_tsg_temperature: float = 2.0, gwai_scale_multiplicative: bool = True,
-              gwai_renormalize: bool = True, gwai_chunk_size: int = 8):
+              gwai_scoring: str = 'gradient', gwai_incremental: bool = True,
+              gwai_tsg_temperature: float = 2.0, gwai_scale_multiplicative: bool = True,
+              gwai_chunk_size: int = 8):
     assert model.cfg.use_attn_result, "Model must be configured to use attention result (model.cfg.use_attn_result)"
     assert model.cfg.use_split_qkv_input, "Model must be configured to use split qkv inputs (model.cfg.use_split_qkv_input)"
     assert model.cfg.use_hook_mlp_in, "Model must be configured to use hook MLP in (model.cfg.use_hook_mlp_in)"
@@ -587,8 +654,9 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
     elif method == 'information-flow-routes':
         scores = get_scores_information_flow_routes(model, graph, dataloader, quiet=quiet)
     elif method == 'GWAI':
-        scores = get_scores_gwai(model, graph, dataloader, k=gwai_k, tsg_temperature=gwai_tsg_temperature,
-                                 scale_multiplicative=gwai_scale_multiplicative, renormalize=gwai_renormalize,
+        scores = get_scores_gwai(model, graph, dataloader, metric=metric, scoring=gwai_scoring,
+                                 incremental=gwai_incremental, tsg_temperature=gwai_tsg_temperature,
+                                 scale_multiplicative=gwai_scale_multiplicative,
                                  chunk_size=gwai_chunk_size, quiet=quiet)
     elif method == 'exact':
         scores = get_scores_exact(model, graph, dataloader, metric, intervention=intervention, intervention_dataloader=intervention_dataloader,
