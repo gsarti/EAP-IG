@@ -118,8 +118,11 @@ def jvp_attention(
     pos = tangent.shape[2]
 
     # --- Frozen LN1 ---
-    ln1_scale = cache[f'blocks.{layer_idx}.ln1.hook_scale']  # (batch, pos, 1)
-    t_ln = tangent / ln1_scale.unsqueeze(1)
+    ln1_scale = cache[f'blocks.{layer_idx}.ln1.hook_scale']
+    # With use_split_qkv_input, scale is (batch, pos, n_heads, 1); collapse to (batch, pos, 1)
+    if ln1_scale.ndim == 4:
+        ln1_scale = ln1_scale[:, :, 0, :]  # identical across heads
+    t_ln = tangent / ln1_scale.unsqueeze(1)  # (batch, 1, pos, 1)
     if not cfg.fold_ln:
         t_ln = t_ln * block.ln1.w  # (d_model,)
 

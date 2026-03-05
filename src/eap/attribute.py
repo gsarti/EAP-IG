@@ -545,7 +545,8 @@ def get_scores_gwai(model: HookedTransformer, graph: Graph, dataloader: DataLoad
 
         # Free cache memory
         del cache
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     scores /= total_items
     return scores
