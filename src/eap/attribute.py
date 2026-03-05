@@ -13,6 +13,10 @@ from .evaluate import evaluate_graph, evaluate_baseline
 from .graph import Graph
 from .gwai import propagate, get_reference, compute_proximity_scores, make_names_filter
 
+
+def _model_device(model: HookedTransformer):
+    return next(model.parameters()).device
+
 def get_scores_exact(model: HookedTransformer, graph: Graph, dataloader:DataLoader, metric: Callable[[Tensor], Tensor], 
                      intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', 
                      intervention_dataloader: Optional[DataLoader]=None, quiet=False):
@@ -57,7 +61,7 @@ def get_scores_eap(model: HookedTransformer, graph: Graph, dataloader:DataLoader
     Returns:
         Tensor: a [src_nodes, dst_nodes] tensor of scores for each edge
     """
-    scores = torch.zeros((graph.n_forward, graph.n_backward), device='cuda', dtype=model.cfg.dtype)    
+    scores = torch.zeros((graph.n_forward, graph.n_backward), device=_model_device(model), dtype=model.cfg.dtype)    
 
     if 'mean' in intervention:
         assert intervention_dataloader is not None, "Intervention dataloader must be provided for mean interventions"
@@ -114,7 +118,7 @@ def get_scores_eap_ig(model: HookedTransformer, graph: Graph, dataloader: DataLo
     Returns:
         Tensor: a [src_nodes, dst_nodes] tensor of scores for each edge
     """
-    scores = torch.zeros((graph.n_forward, graph.n_backward), device='cuda', dtype=model.cfg.dtype)    
+    scores = torch.zeros((graph.n_forward, graph.n_backward), device=_model_device(model), dtype=model.cfg.dtype)    
     
     total_items = 0
     dataloader = dataloader if quiet else tqdm(dataloader)
@@ -195,7 +199,7 @@ def get_scores_ig_activations(model: HookedTransformer, graph: Graph, dataloader
         if not per_position:
             means = means.unsqueeze(0)
 
-    scores = torch.zeros((graph.n_forward, graph.n_backward), device='cuda', dtype=model.cfg.dtype)    
+    scores = torch.zeros((graph.n_forward, graph.n_backward), device=_model_device(model), dtype=model.cfg.dtype)    
     
     total_items = 0
     dataloader = dataloader if quiet else tqdm(dataloader)
@@ -271,7 +275,7 @@ def get_scores_clean_corrupted(model: HookedTransformer, graph: Graph, dataloade
         _type_: _description_
     """
 
-    scores = torch.zeros((graph.n_forward, graph.n_backward), device='cuda', dtype=model.cfg.dtype)    
+    scores = torch.zeros((graph.n_forward, graph.n_backward), device=_model_device(model), dtype=model.cfg.dtype)    
     
     total_items = 0
     dataloader = dataloader if quiet else tqdm(dataloader)
@@ -322,7 +326,7 @@ def get_scores_information_flow_routes(model: HookedTransformer, graph: Graph, d
         Tensor: scores based on information flow routes
     """
     # I could do some hacky overriding of make_hooks_and_matrices here but I will not
-    scores = torch.zeros((graph.n_forward, graph.n_backward), device='cuda', dtype=model.cfg.dtype)    
+    scores = torch.zeros((graph.n_forward, graph.n_backward), device=_model_device(model), dtype=model.cfg.dtype)    
 
     def make_hooks(n_pos: int, input_lengths: torch.Tensor) -> List[Tuple[str, Callable]]:
         output_activations = torch.zeros((batch_size, n_pos, graph.n_forward, model.cfg.d_model), device=model.cfg.device, dtype=model.cfg.dtype)
@@ -445,7 +449,7 @@ def get_scores_gwai(model: HookedTransformer, graph: Graph, dataloader: DataLoad
     Returns:
         Tensor: a [src_nodes, dst_nodes] tensor of scores for each edge
     """
-    scores = torch.zeros((graph.n_forward, graph.n_backward), device='cuda', dtype=model.cfg.dtype)
+    scores = torch.zeros((graph.n_forward, graph.n_backward), device=_model_device(model), dtype=model.cfg.dtype)
 
     names_filter = make_names_filter(model, k)
     n_layers = graph.cfg['n_layers']
