@@ -11,6 +11,7 @@ from tqdm import tqdm
 from .utils import tokenize_plus, make_hooks_and_matrices, compute_mean_activations
 from .evaluate import evaluate_graph, evaluate_baseline
 from .graph import Graph
+from .gwai import propagate, get_reference, compute_proximity_scores, make_names_filter
 
 def get_scores_exact(model: HookedTransformer, graph: Graph, dataloader:DataLoader, metric: Callable[[Tensor], Tensor], 
                      intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', 
@@ -414,11 +415,145 @@ def get_scores_information_flow_routes(model: HookedTransformer, graph: Graph, d
 
     return scores
 
-allowed_aggregations = {'sum', 'mean'}    
-def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor], 
-              method: Literal['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'exact'], 
-              intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', aggregation='sum', 
-              ig_steps: Optional[int]=None, intervention_dataloader: Optional[DataLoader]=None, quiet=False):
+def get_scores_gwai(model: HookedTransformer, graph: Graph, dataloader: DataLoader,
+                    k: int = 1, tsg_temperature: float = 2.0, scale_multiplicative: bool = True,
+                    renormalize: bool = True, chunk_size: int = 8, quiet: bool = False) -> torch.Tensor:
+    """Gets scores using GWAI: GIM-corrected ALTI with downstream look-ahead.
+
+    For each edge, propagates the source node's activation through k subsequent
+    transformer layers using GIM-corrected JVPs (temperature-adjusted softmax,
+    frozen LayerNorm, Shapley gradient normalization), then scores using the ALTI
+    proximity metric at the downstream point.
+
+    k=0 recovers pure ALTI (information-flow-routes).
+    k=1 captures the dominant self-repair effects from the next layer.
+    k=2+ provides progressively more faithful attribution at higher cost.
+
+    Args:
+        model: the model to attribute
+        graph: the graph to attribute
+        dataloader: the data over which to attribute
+        k: number of look-ahead layers (0 = pure ALTI, 1+ = GWAI)
+        tsg_temperature: temperature for TSG softmax correction (default 2.0)
+        scale_multiplicative: whether to apply Shapley /2 at multiplicative junctions
+        renormalize: if True, use sum of propagated contributions as reference
+                     instead of actual downstream residual stream (recommended for k>0)
+        chunk_size: number of source nodes to process simultaneously in JVP
+                    (reduce for long sequences or limited GPU memory)
+        quiet: suppress tqdm output
+
+    Returns:
+        Tensor: a [src_nodes, dst_nodes] tensor of scores for each edge
+    """
+    scores = torch.zeros((graph.n_forward, graph.n_backward), device='cuda', dtype=model.cfg.dtype)
+
+    names_filter = make_names_filter(model, k)
+    n_layers = graph.cfg['n_layers']
+    n_heads = graph.cfg['n_heads']
+
+    total_items = 0
+    dataloader = dataloader if quiet else tqdm(dataloader)
+    for clean, _, _ in dataloader:
+        batch_size = len(clean)
+        total_items += batch_size
+        clean_tokens, attention_mask, input_lengths, n_pos = tokenize_plus(model, clean)
+
+        # Run forward pass and cache needed activations
+        with torch.inference_mode():
+            _, cache = model.run_with_cache(clean_tokens, attention_mask=attention_mask,
+                                            names_filter=names_filter)
+
+        # Build source activations tensor: (batch, pos, n_forward, d_model)
+        source_acts = torch.zeros((batch_size, n_pos, graph.n_forward, model.cfg.d_model),
+                                  device=model.cfg.device, dtype=model.cfg.dtype)
+
+        # Input embeddings
+        source_acts[:, :, 0] = cache['hook_embed']
+
+        for layer in range(n_layers):
+            # Attention head outputs (per-head, already projected through W_O)
+            attn_node = graph.nodes[f'a{layer}.h0']
+            fwd_idx = graph.forward_index(attn_node)  # slice for all heads
+            attn_result = cache[f'blocks.{layer}.attn.hook_result']  # (batch, pos, n_heads, d_model)
+            source_acts[:, :, fwd_idx] = attn_result
+
+            # MLP output
+            mlp_node = graph.nodes[f'm{layer}']
+            mlp_fwd_idx = graph.forward_index(mlp_node, attn_slice=False)
+            source_acts[:, :, mlp_fwd_idx] = cache[f'blocks.{layer}.hook_mlp_out']
+
+        # Score each destination node
+        for layer in range(n_layers):
+            # --- Attention destinations (q, k, v) ---
+            attn_node = graph.nodes[f'a{layer}.h0']
+            prev_index = graph.prev_index(attn_node)
+
+            if prev_index > 0:
+                contribs = source_acts[:, :, :prev_index]  # (batch, pos, n_src, d_model)
+
+                with torch.inference_mode():
+                    propagated = propagate(contribs, layer, 'attention', k, model, cache,
+                                           tsg_temperature, scale_multiplicative, chunk_size)
+                    reference = get_reference(layer, 'attention', k, model, cache)
+
+                importance = compute_proximity_scores(
+                    propagated, reference, input_lengths, renormalize=(renormalize and k > 0)
+                )
+                # importance: (n_src,) — same for all heads and all qkv types
+                for letter in 'qkv':
+                    bwd_idx = graph.backward_index(attn_node, qkv=letter)
+                    # bwd_idx is a slice for all heads; importance is per-source
+                    scores[:prev_index, bwd_idx] += importance.unsqueeze(1).expand(-1, n_heads)
+
+            # --- MLP destination ---
+            mlp_node = graph.nodes[f'm{layer}']
+            prev_index_mlp = graph.prev_index(mlp_node)
+
+            if prev_index_mlp > 0:
+                contribs_mlp = source_acts[:, :, :prev_index_mlp]
+
+                with torch.inference_mode():
+                    propagated_mlp = propagate(contribs_mlp, layer, 'mlp', k, model, cache,
+                                               tsg_temperature, scale_multiplicative, chunk_size)
+                    reference_mlp = get_reference(layer, 'mlp', k, model, cache)
+
+                importance_mlp = compute_proximity_scores(
+                    propagated_mlp, reference_mlp, input_lengths, renormalize=(renormalize and k > 0)
+                )
+                bwd_idx_mlp = graph.backward_index(mlp_node)
+                scores[:prev_index_mlp, bwd_idx_mlp] += importance_mlp
+
+        # --- Logits destination ---
+        logit_node = graph.nodes['logits']
+        prev_index_logits = graph.prev_index(logit_node)
+        contribs_logits = source_acts[:, :, :prev_index_logits]
+
+        with torch.inference_mode():
+            propagated_logits = propagate(contribs_logits, n_layers, 'logits', k, model, cache,
+                                          tsg_temperature, scale_multiplicative, chunk_size)
+            reference_logits = get_reference(n_layers, 'logits', k, model, cache)
+
+        importance_logits = compute_proximity_scores(
+            propagated_logits, reference_logits, input_lengths, renormalize=(renormalize and k > 0)
+        )
+        bwd_idx_logits = graph.backward_index(logit_node)
+        scores[:prev_index_logits, bwd_idx_logits] += importance_logits
+
+        # Free cache memory
+        del cache
+        torch.cuda.empty_cache()
+
+    scores /= total_items
+    return scores
+
+
+allowed_aggregations = {'sum', 'mean'}
+def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor],
+              method: Literal['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'GWAI', 'exact'],
+              intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', aggregation='sum',
+              ig_steps: Optional[int]=None, intervention_dataloader: Optional[DataLoader]=None, quiet=False,
+              gwai_k: int = 1, gwai_tsg_temperature: float = 2.0, gwai_scale_multiplicative: bool = True,
+              gwai_renormalize: bool = True, gwai_chunk_size: int = 8):
     assert model.cfg.use_attn_result, "Model must be configured to use attention result (model.cfg.use_attn_result)"
     assert model.cfg.use_split_qkv_input, "Model must be configured to use split qkv inputs (model.cfg.use_split_qkv_input)"
     assert model.cfg.use_hook_mlp_in, "Model must be configured to use hook MLP in (model.cfg.use_hook_mlp_in)"
@@ -446,11 +581,15 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
                                            intervention_dataloader=intervention_dataloader, quiet=quiet)
     elif method == 'information-flow-routes':
         scores = get_scores_information_flow_routes(model, graph, dataloader, quiet=quiet)
+    elif method == 'GWAI':
+        scores = get_scores_gwai(model, graph, dataloader, k=gwai_k, tsg_temperature=gwai_tsg_temperature,
+                                 scale_multiplicative=gwai_scale_multiplicative, renormalize=gwai_renormalize,
+                                 chunk_size=gwai_chunk_size, quiet=quiet)
     elif method == 'exact':
-        scores = get_scores_exact(model, graph, dataloader, metric, intervention=intervention, intervention_dataloader=intervention_dataloader, 
+        scores = get_scores_exact(model, graph, dataloader, metric, intervention=intervention, intervention_dataloader=intervention_dataloader,
                                   quiet=quiet)
     else:
-        raise ValueError(f"method must be in ['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'exact'], but got {method}")
+        raise ValueError(f"method must be in ['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'GWAI', 'exact'], but got {method}")
 
 
     if aggregation == 'mean':
