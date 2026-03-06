@@ -632,9 +632,46 @@ def get_scores_gwai(model: HookedTransformer, graph: Graph, dataloader: DataLoad
     return scores
 
 
+def get_scores_gim(model: HookedTransformer, graph: Graph, dataloader: DataLoader,
+                    metric: Callable[[Tensor], Tensor],
+                    intervention: Literal['patching', 'zero', 'mean', 'mean-positional'] = 'patching',
+                    intervention_dataloader: Optional[DataLoader] = None,
+                    quiet: bool = False) -> torch.Tensor:
+    """Gets edge attribution scores using GIM (Gradient-based Interpretability Method).
+
+    Uses the gim-explain package's context manager to patch the model's backward
+    pass with GIM's modified gradient rules:
+    - Frozen LayerNorm (detach normalization statistics)
+    - Temperature-scaled softmax gradient (TSG, T=2.0)
+    - Shapley normalization (Q/K ÷4, V ÷2)
+
+    Edge scores are activation_diff × GIM-corrected gradient, computed via
+    EAP's hook infrastructure within the GIM context.
+
+    Args:
+        model: the model to attribute
+        graph: the graph to attribute
+        dataloader: the data over which to attribute
+        metric: the metric to attribute w.r.t.
+        intervention: intervention type (same as EAP)
+        intervention_dataloader: dataloader for mean interventions
+        quiet: suppress tqdm output
+
+    Returns:
+        Tensor: a [src_nodes, dst_nodes] tensor of scores for each edge
+    """
+    import gim
+
+    with gim.GIM(model):
+        return get_scores_eap(model, graph, dataloader, metric,
+                              intervention=intervention,
+                              intervention_dataloader=intervention_dataloader,
+                              quiet=quiet)
+
+
 allowed_aggregations = {'sum', 'mean'}
 def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor],
-              method: Literal['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'GWAI', 'exact'],
+              method: Literal['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'GWAI', 'GIM', 'exact'],
               intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', aggregation='sum',
               ig_steps: Optional[int]=None, intervention_dataloader: Optional[DataLoader]=None, quiet=False,
               gwai_scoring: str = 'combined', gwai_incremental: bool = True,
@@ -672,11 +709,13 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
                                  incremental=gwai_incremental, tsg_temperature=gwai_tsg_temperature,
                                  scale_multiplicative=gwai_scale_multiplicative,
                                  chunk_size=gwai_chunk_size, quiet=quiet)
+    elif method == 'GIM':
+        scores = get_scores_gim(model, graph, dataloader, metric, quiet=quiet)
     elif method == 'exact':
         scores = get_scores_exact(model, graph, dataloader, metric, intervention=intervention, intervention_dataloader=intervention_dataloader,
                                   quiet=quiet)
     else:
-        raise ValueError(f"method must be in ['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'GWAI', 'exact'], but got {method}")
+        raise ValueError(f"method must be in ['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'GWAI', 'GIM', 'exact'], but got {method}")
 
 
     if aggregation == 'mean':
