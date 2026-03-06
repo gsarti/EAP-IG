@@ -597,7 +597,7 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
         # --- Pass 1: Corrupted forward (fill activation_difference) ---
         with torch.inference_mode():
             with model.hooks(fwd_hooks=fwd_hooks_corrupted):
-                model(corrupted_tokens, attention_mask=attention_mask)
+                corrupted_logits = model(corrupted_tokens, attention_mask=attention_mask)
 
         # --- Pass 2: Clean forward (source acts + filter scores) + backward (gradient scores) ---
         gim_ctx = nullcontext()
@@ -614,13 +614,14 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
 
         model.zero_grad()
 
-        # Logit filter: compute per-source scores via unembedding projection
+        # Logit filter: contrastive scores via unembedding projection
         if filter_mode in ('logit', 'logit*proximity') and source_acts_clean is not None:
-            pred_tokens = clean_logits[
-                torch.arange(batch_size, device=device), input_lengths - 1
-            ].argmax(dim=-1)
+            batch_idx = torch.arange(batch_size, device=device)
+            pred_tokens = clean_logits[batch_idx, input_lengths - 1].argmax(dim=-1)
+            foil_tokens = corrupted_logits[batch_idx, input_lengths - 1].argmax(dim=-1)
             ls = compute_logit_scores(
-                source_acts_clean, model.unembed.W_U, input_lengths, pred_tokens)
+                source_acts_clean, model.unembed.W_U, input_lengths,
+                pred_tokens, foil_tokens)
             ls_expanded = ls.unsqueeze(1).expand_as(scores_prox)
             if filter_mode == 'logit':
                 scores_prox += ls_expanded
@@ -644,7 +645,7 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
     else:
         scores_prox /= total_items
 
-    prox_flat = scores_prox[scores_prox > 0]
+    prox_flat = scores_prox[scores_prox > 0].float()
     if prox_flat.numel() > 0:
         threshold = torch.quantile(prox_flat, filter_quantile)
         mask = scores_prox >= threshold
@@ -737,7 +738,8 @@ def _compute_filter_scores(
 
     total_items = 0
     dataloader_iter = dataloader if quiet else tqdm(dataloader)
-    for clean, _, _ in dataloader_iter:
+    needs_corrupted = filter_mode in ('logit', 'logit*proximity')
+    for clean, corrupted, _ in dataloader_iter:
         batch_size = len(clean)
         total_items += batch_size
         clean_tokens, attention_mask, input_lengths, n_pos = tokenize_plus(model, clean)
@@ -807,13 +809,18 @@ def _compute_filter_scores(
             with model.hooks(fwd_hooks=fwd_hooks):
                 logits = model(clean_tokens, attention_mask=attention_mask)
 
-        # Logit filter: compute per-source scores via unembedding projection
+        # Logit filter: contrastive scores via unembedding projection
         if filter_mode in ('logit', 'logit*proximity'):
-            pred_tokens = logits[
-                torch.arange(batch_size, device=device), input_lengths - 1
-            ].argmax(dim=-1)
+            batch_idx = torch.arange(batch_size, device=device)
+            pred_tokens = logits[batch_idx, input_lengths - 1].argmax(dim=-1)
+            # Run corrupted forward to get foil tokens
+            corrupted_tokens, _, _, _ = tokenize_plus(model, corrupted)
+            with torch.inference_mode():
+                corrupted_logits = model(corrupted_tokens, attention_mask=attention_mask)
+            foil_tokens = corrupted_logits[batch_idx, input_lengths - 1].argmax(dim=-1)
             ls = compute_logit_scores(
-                source_acts_clean, model.unembed.W_U, input_lengths, pred_tokens)
+                source_acts_clean, model.unembed.W_U, input_lengths,
+                pred_tokens, foil_tokens)
             ls_expanded = ls.unsqueeze(1).expand_as(scores_filt)
             if filter_mode == 'logit':
                 scores_filt += ls_expanded
@@ -863,7 +870,7 @@ def get_scores_pf_gim_ig(model: HookedTransformer, graph: Graph, dataloader: Dat
     else:
         scores_prox = _compute_filter_scores(model, graph, dataloader, filter_mode, quiet)
 
-    prox_flat = scores_prox[scores_prox > 0]
+    prox_flat = scores_prox[scores_prox > 0].float()
     if prox_flat.numel() > 0:
         threshold = torch.quantile(prox_flat, filter_quantile)
         mask = scores_prox >= threshold

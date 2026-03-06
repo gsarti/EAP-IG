@@ -13,6 +13,8 @@ Scoring functions for the filtering heuristics:
     (Ferrando et al., ACL 2023)
 """
 
+from typing import Optional
+
 import torch
 from torch import Tensor
 
@@ -101,18 +103,20 @@ def compute_logit_scores(
     W_U: Tensor,
     input_lengths: Tensor,
     target_tokens: Tensor,
+    foil_tokens: Optional[Tensor] = None,
 ) -> Tensor:
-    """Logit-space importance: contribution to predicted token's logit.
+    """Logit-space importance: contrastive contribution to predicted token's logit.
 
     For each source, computes how much its contribution at the output position
-    pushes the logit of the predicted token, following Ferrando et al. (ACL 2023).
-    Uses the dot product with the target token's unembedding vector rather than
-    the full vocab projection, making it both efficient and discriminative.
+    pushes the logit of the predicted token (and away from the foil token if
+    provided), following Ferrando et al. (ACL 2023). Uses the dot product with
+    the contrastive unembedding direction (target - foil).
 
     contributions: (batch, pos, n_src, d_model)
     W_U: (d_model, d_vocab)
     input_lengths: (batch,)
-    target_tokens: (batch,) predicted token indices
+    target_tokens: (batch,) clean predicted token indices
+    foil_tokens: (batch,) corrupted predicted token indices (optional)
 
     Returns: (n_src,) scores aggregated over batch.
     """
@@ -125,11 +129,12 @@ def compute_logit_scores(
         torch.arange(batch_size, device=device), output_idx
     ]
 
-    # Get unembedding vectors for target tokens: (batch, d_model)
-    target_unembed = W_U[:, target_tokens].T
+    # Contrastive unembedding direction: (batch, d_model)
+    direction = W_U[:, target_tokens].T
+    if foil_tokens is not None:
+        direction = direction - W_U[:, foil_tokens].T
 
-    # Dot product: how much each source pushes the predicted token's logit
-    # (batch, n_src, d_model) × (batch, 1, d_model) -> (batch, n_src)
-    logit_contribs = torch.einsum('bsd,bd->bs', output_contribs, target_unembed)
+    # Dot product: how much each source pushes along the contrastive direction
+    logit_contribs = torch.einsum('bsd,bd->bs', output_contribs, direction)
 
     return logit_contribs.abs().sum(dim=0)
