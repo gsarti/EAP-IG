@@ -507,6 +507,8 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
                 ep = compute_norm_scores(contribs, input_lengths)
             elif filter_mode == 'cosine':
                 ep = compute_cosine_scores(contribs, ref, input_lengths)
+            else:
+                return
             if is_attn:
                 scores_prox[:prev_index, bwd_index] += ep.unsqueeze(1).expand_as(
                     scores_prox[:prev_index, bwd_index])
@@ -749,6 +751,8 @@ def _compute_filter_scores(
                 ep = compute_norm_scores(contribs, input_lengths)
             elif filter_mode == 'cosine':
                 ep = compute_cosine_scores(contribs, ref, input_lengths)
+            else:
+                return
             if is_attn:
                 scores_filt[:prev_index, bwd_index] += ep.unsqueeze(1).expand_as(
                     scores_filt[:prev_index, bwd_index])
