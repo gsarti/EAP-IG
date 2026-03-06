@@ -413,7 +413,7 @@ def cd_edge_scores(
             # (n_src * batch, pos, n_heads, d_head) → (n_src, batch, pos, n_heads, d_head)
             rp_5d = rp.view(n_src, batch, n_pos, n_heads, -1)
             # L1 per source per head: sum d_head, mask, sum batch+pos
-            l1 = (rp_5d.abs().sum(dim=-1) * pm.unsqueeze(-1)).sum(dim=(1, 2))  # (n_src, n_heads)
+            l1 = (rp_5d.abs().sum(dim=-1) * pm.view(n_src, batch, n_pos, 1)).sum(dim=(1, 2))  # (n_src, n_heads)
             for h in range(n_heads):
                 bwd = layer * (3 * n_heads + 1) + qkv_off * n_heads + h
                 for si, src_fwd in enumerate(src_fwd_list):
@@ -433,12 +433,19 @@ def cd_edge_scores(
                 bwd = layer * (3 * n_heads + 1) + qkv_off * n_heads + h
                 scores[src_fwd, bwd] += _l1(rp[:, :, h, :], pos_mask)
 
+    def _expand_causal(n_src):
+        """Expand causal mask from (batch, 1, pos, pos) to (n_src*batch, 1, pos, pos)."""
+        if causal.shape[0] <= 1:
+            return causal  # already broadcasts
+        return causal.repeat(n_src, 1, 1, 1)
+
     def _propagate_batched(rel, irrel, start_layer, src_fwd_list, n_src, pm):
         """Propagate n_src sources batched along dim 0.
         rel/irrel: (n_src * batch, pos, d_model)
         pm: (n_src * batch, pos) — batched pos_mask
         """
         r, ir = rel, irrel
+        causal_b = _expand_causal(n_src)
         for l in range(start_layer, n_layers):
             blk = model.blocks[l]
             lc = fc.layers[l]
@@ -446,12 +453,11 @@ def cd_edge_scores(
             inv1 = _expand_cache_inv_std(lc.ln1_inv_std, n_src)
             r_ln, ir_ln = cd_layer_norm(r, ir, w1, b1, eps1, inv_std=inv1)
             _score_qkv_batched(r_ln, ir_ln, l, src_fwd_list, n_src, pm)
-            r_attn, ir_attn = cd_attention(r_ln, ir_ln, blk, causal, cache=lc)
+            r_attn, ir_attn = cd_attention(r_ln, ir_ln, blk, causal_b, cache=lc)
             r_mid = r + r_attn; ir_mid = ir + ir_attn; _normalize(r_mid, ir_mid)
             w2, b2, eps2 = _ln_params(blk.ln2)
             inv2 = _expand_cache_inv_std(lc.ln2_inv_std, n_src)
             r_ln2, ir_ln2 = cd_layer_norm(r_mid, ir_mid, w2, b2, eps2, inv_std=inv2)
-            # MLP destination score per source
             r_ln2_5d = r_ln2.view(n_src, batch, n_pos, -1)
             l1_mlp = (r_ln2_5d.abs().sum(dim=-1) * pm.view(n_src, batch, n_pos)).sum(dim=(1, 2))
             mlp_bwd = l * (3 * n_heads + 1) + 3 * n_heads
@@ -601,7 +607,7 @@ def cd_edge_scores_full(
             d = rp.abs() + ip.abs() + tol
             rp = rp + b * (rp.abs() / d)
             rp_5d = rp.view(n_src, batch, n_pos, n_heads, -1)
-            l1 = (rp_5d.abs().sum(dim=-1) * pm.unsqueeze(-1)).sum(dim=(1, 2))
+            l1 = (rp_5d.abs().sum(dim=-1) * pm.view(n_src, batch, n_pos, 1)).sum(dim=(1, 2))
             for h in range(n_heads):
                 bwd = layer * (3 * n_heads + 1) + qkv_off * n_heads + h
                 for si, src_fwd in enumerate(src_fwd_list):
@@ -621,8 +627,14 @@ def cd_edge_scores_full(
                 bwd = layer * (3 * n_heads + 1) + qkv_off * n_heads + h
                 scores[src_fwd, bwd] += _l1(rp[:, :, h, :], pos_mask)
 
+    def _expand_causal_full(n_src):
+        if causal.shape[0] <= 1:
+            return causal
+        return causal.repeat(n_src, 1, 1, 1)
+
     def _propagate_batched(rel, irrel, start_layer, src_fwd_list, n_src, pm):
         r, ir = rel, irrel
+        causal_b = _expand_causal_full(n_src)
         for l in range(start_layer, n_layers):
             blk = model.blocks[l]
             lc = fc.layers[l]
@@ -630,7 +642,7 @@ def cd_edge_scores_full(
             inv1 = _expand_cache_inv_std(lc.ln1_inv_std, n_src)
             r_ln, ir_ln = cd_layer_norm(r, ir, w1, b1, eps1, inv_std=inv1)
             _score_qkv_batched(r_ln, ir_ln, l, src_fwd_list, n_src, pm)
-            r_attn, ir_attn = cd_attention(r_ln, ir_ln, blk, causal, cache=lc)
+            r_attn, ir_attn = cd_attention(r_ln, ir_ln, blk, causal_b, cache=lc)
             r_mid = r + r_attn; ir_mid = ir + ir_attn; _normalize(r_mid, ir_mid)
             w2, b2, eps2 = _ln_params(blk.ln2)
             inv2 = _expand_cache_inv_std(lc.ln2_inv_std, n_src)
