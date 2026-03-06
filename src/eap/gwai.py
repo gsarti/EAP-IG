@@ -302,41 +302,118 @@ def _propagate_chunked_mlp(
 # Scoring functions
 # ---------------------------------------------------------------------------
 
-def compute_gradient_scores(
+def _proximity_per_sample(
+    contributions: Tensor,
+    reference: Tensor,
+) -> Tensor:
+    """Compute normalized ALTI proximity per sample and position (no aggregation).
+
+    contributions: (batch, pos, n_src, d_model)
+    reference: (batch, pos, d_model)
+
+    Returns: (batch, pos, n_src) normalized proximity weights (sum to 1 across sources).
+    """
+    ref_unsq = reference.unsqueeze(2)
+    dist = torch.linalg.vector_norm(contributions - ref_unsq, ord=1, dim=-1)
+    ref_norm = torch.linalg.vector_norm(ref_unsq, ord=1, dim=-1)
+    proximity = torch.clamp(-dist + ref_norm, min=0)
+    prox_sum = proximity.sum(dim=2, keepdim=True).clamp(min=1e-10)
+    return proximity / prox_sum
+
+
+def _gradient_projection_per_sample(
+    contributions: Tensor,
+    grad: Tensor,
+) -> Tensor:
+    """Compute per-sample gradient projection (no aggregation).
+
+    contributions: (batch, pos, n_src, d_model)
+    grad: (batch, pos, d_model) or (batch, pos, n_heads, d_model)
+
+    Returns: (batch, pos, n_src) or (batch, pos, n_src, n_heads)
+    """
+    if grad.ndim == 4:
+        return torch.einsum('bpsd,bphd->bpsh', contributions, grad)
+    return (contributions * grad.unsqueeze(2)).sum(dim=-1)
+
+
+def _mask_and_aggregate(
+    scores: Tensor,
+    input_lengths: Tensor,
+) -> Tensor:
+    """Mask padding positions and aggregate over positions and batch.
+
+    scores: (batch, pos, n_src, ...) — may have trailing n_heads dim
+    input_lengths: (batch,)
+
+    Returns: (n_src,) or (n_src, n_heads)
+    """
+    max_len = input_lengths.max()
+    mask = torch.arange(max_len, device=input_lengths.device, dtype=input_lengths.dtype
+                        ).expand(len(input_lengths), max_len) < input_lengths.unsqueeze(1)
+    # expand mask to match scores dims
+    for _ in range(scores.ndim - 2):
+        mask = mask.unsqueeze(-1)
+    scores = scores * mask
+    scores = scores.sum(dim=1)  # sum over positions
+    return scores.sum(dim=0)    # sum over batch
+
+
+def compute_edge_gradient_scores(
     contributions: Tensor,
     grad: Tensor,
     input_lengths: Tensor,
 ) -> Tensor:
-    """Score each source by projecting its contribution onto the task gradient.
+    """Score edges via dot product with destination gradient.
 
-    score_j = ||z_j * (grad / ||grad||)||_1
+    score_j = Σ_batch Σ_pos z_j[d] × grad_dest[d]
 
     contributions: (batch, pos, n_src, d_model)
-    grad: (batch, pos, d_model) - gradient of metric w.r.t. residual stream
+    grad: (batch, pos, d_model) or (batch, pos, n_heads, d_model)
     input_lengths: (batch,)
 
-    Returns: (n_src,) scores aggregated over batch and positions.
+    Returns: (n_src,) or (n_src, n_heads)
     """
-    # Normalize gradient per position to get direction
-    grad_norm = torch.linalg.vector_norm(grad, ord=2, dim=-1, keepdim=True).clamp(min=1e-10)
-    grad_dir = grad / grad_norm  # (batch, pos, d_model)
+    scores = _gradient_projection_per_sample(contributions, grad)
+    return _mask_and_aggregate(scores, input_lengths)
 
-    # Project each source onto gradient direction and take L1 norm
-    # contributions: (batch, pos, n_src, d_model)
-    # grad_dir: (batch, pos, 1, d_model) after unsqueeze
-    weighted = contributions * grad_dir.unsqueeze(2)  # (batch, pos, n_src, d_model)
-    scores_per_src = torch.linalg.vector_norm(weighted, ord=1, dim=-1)  # (batch, pos, n_src)
 
-    # Mask padding
-    max_len = input_lengths.max()
-    mask = torch.arange(max_len, device=input_lengths.device, dtype=input_lengths.dtype
-                        ).expand(len(input_lengths), max_len) < input_lengths.unsqueeze(1)
-    mask = mask.unsqueeze(-1)
-    scores_per_src = scores_per_src * mask
+def compute_combined_scores(
+    contributions: Tensor,
+    reference: Tensor,
+    grad: Tensor,
+    input_lengths: Tensor,
+) -> Tensor:
+    """Score edges by proximity-weighted gradient projection (GWAI).
 
-    # Mean over positions, sum over batch
-    scores_per_src = scores_per_src.sum(dim=1) / input_lengths.view(-1, 1)
-    return scores_per_src.sum(dim=0)
+    Per position and sample:
+      score_j = proximity(z_j, y) × (z_j · grad_dest)
+
+    ALTI proximity provides structural weights (how much does this source
+    account for the representation), gradient projection provides task
+    direction (in what direction should the representation change).
+    The product selects edges that are both structurally important AND
+    task-relevant.
+
+    contributions: (batch, pos, n_src, d_model)
+    reference: (batch, pos, d_model)
+    grad: (batch, pos, d_model) or (batch, pos, n_heads, d_model)
+    input_lengths: (batch,)
+
+    Returns: (n_src,) or (n_src, n_heads)
+    """
+    proximity = _proximity_per_sample(contributions, reference)  # (batch, pos, n_src)
+    grad_proj = _gradient_projection_per_sample(contributions, grad)
+
+    per_head = grad.ndim == 4
+    if per_head:
+        # proximity: (batch, pos, n_src) -> (batch, pos, n_src, 1)
+        # grad_proj: (batch, pos, n_src, n_heads)
+        combined = proximity.unsqueeze(-1) * grad_proj
+    else:
+        combined = proximity * grad_proj  # (batch, pos, n_src)
+
+    return _mask_and_aggregate(combined, input_lengths)
 
 
 def compute_proximity_scores(
