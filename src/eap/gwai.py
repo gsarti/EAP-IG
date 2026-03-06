@@ -379,7 +379,8 @@ def compute_edge_gradient_scores(
 
 
 def compute_combined_scores(
-    contributions: Tensor,
+    contributions_prox: Tensor,
+    contributions_grad: Tensor,
     reference: Tensor,
     grad: Tensor,
     input_lengths: Tensor,
@@ -387,23 +388,21 @@ def compute_combined_scores(
     """Score edges by proximity-weighted gradient projection (GWAI).
 
     Per position and sample:
-      score_j = proximity(z_j, y) × (z_j · grad_dest)
+      score_j = proximity(z_j^clean, y^clean) × ((z_j^corr - z_j^clean) · grad_dest)
 
-    ALTI proximity provides structural weights (how much does this source
-    account for the representation), gradient projection provides task
-    direction (in what direction should the representation change).
-    The product selects edges that are both structurally important AND
-    task-relevant.
+    ALTI proximity on clean sources provides structural weights, gradient
+    projection on activation differences provides the counterfactual task signal.
 
-    contributions: (batch, pos, n_src, d_model)
-    reference: (batch, pos, d_model)
+    contributions_prox: (batch, pos, n_src, d_model) — clean sources for proximity
+    contributions_grad: (batch, pos, n_src, d_model) — activation diffs for gradient
+    reference: (batch, pos, d_model) — clean residual stream
     grad: (batch, pos, d_model) or (batch, pos, n_heads, d_model)
     input_lengths: (batch,)
 
     Returns: (n_src,) or (n_src, n_heads)
     """
-    proximity = _proximity_per_sample(contributions, reference)  # (batch, pos, n_src)
-    grad_proj = _gradient_projection_per_sample(contributions, grad)
+    proximity = _proximity_per_sample(contributions_prox, reference)  # (batch, pos, n_src)
+    grad_proj = _gradient_projection_per_sample(contributions_grad, grad)
 
     per_head = grad.ndim == 4
     if per_head:
