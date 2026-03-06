@@ -51,20 +51,32 @@ def cd_linear(rel: Tensor, irrel: Tensor, W: Tensor, b: Tensor,
 
 
 def cd_layer_norm(rel: Tensor, irrel: Tensor,
-                  w: Tensor, b: Tensor, eps: float = 1e-5,
+                  w, b, eps: float = 1e-5,
                   tol: float = 1e-8) -> Tuple[Tensor, Tensor]:
-    """LayerNorm decomposition (pre-norm GPT style)."""
+    """LayerNorm decomposition (pre-norm GPT style).
+
+    ``w`` and ``b`` may be ``None`` (e.g. ``LayerNormPre`` with ``fold_ln=True``),
+    in which case the affine transform is skipped (equivalent to w=1, b=0).
+    """
     tot = rel + irrel
     r_mean = rel.mean(dim=-1, keepdim=True)
     ir_mean = irrel.mean(dim=-1, keepdim=True)
     var = tot.pow(2).mean(-1, keepdim=True) - tot.mean(-1, keepdim=True).pow(2)
     inv_std = (var + eps).rsqrt()
 
-    r_out = (rel - r_mean) * inv_std * w
-    ir_out = (irrel - ir_mean) * inv_std * w
+    r_out = (rel - r_mean) * inv_std
+    ir_out = (irrel - ir_mean) * inv_std
 
-    frac = rel.abs() / (rel.abs() + irrel.abs() + tol)
-    return r_out + b * frac, ir_out + b * (1 - frac)
+    if w is not None:
+        r_out = r_out * w
+        ir_out = ir_out * w
+
+    if b is not None:
+        frac = r_out.abs() / (r_out.abs() + ir_out.abs() + tol)
+        r_out = r_out + b * frac
+        ir_out = ir_out + b * (1 - frac)
+
+    return r_out, ir_out
 
 
 def cd_gelu(rel: Tensor, irrel: Tensor) -> Tuple[Tensor, Tensor]:
@@ -77,6 +89,13 @@ def _get_eps(ln_module) -> float:
     if hasattr(ln_module, 'cfg') and hasattr(ln_module.cfg, 'eps'):
         return ln_module.cfg.eps
     return 1e-5
+
+
+def _ln_params(ln_module):
+    """Return (w, b, eps) from a LayerNorm or LayerNormPre module."""
+    w = getattr(ln_module, 'w', None)
+    b = getattr(ln_module, 'b', None)
+    return w, b, _get_eps(ln_module)
 
 
 # ---------------------------------------------------------------------------
@@ -281,17 +300,17 @@ def cd_edge_scores(
         r, ir = rel, irrel
         for l in range(start_layer, n_layers):
             blk = model.blocks[l]
-            r_ln, ir_ln = cd_layer_norm(r, ir, blk.ln1.w, blk.ln1.b, eps=_get_eps(blk.ln1))
+            r_ln, ir_ln = cd_layer_norm(r, ir, *_ln_params(blk.ln1))
             _score_qkv(r_ln, ir_ln, l, src_fwd)
             r_attn, ir_attn = cd_attention(r_ln, ir_ln, blk, causal)
             r_mid = r + r_attn; ir_mid = ir + ir_attn; _normalize(r_mid, ir_mid)
-            r_ln2, ir_ln2 = cd_layer_norm(r_mid, ir_mid, blk.ln2.w, blk.ln2.b, eps=_get_eps(blk.ln2))
+            r_ln2, ir_ln2 = cd_layer_norm(r_mid, ir_mid, *_ln_params(blk.ln2))
             scores[src_fwd, l * (3 * n_heads + 1) + 3 * n_heads] += _l1(r_ln2, pos_mask)
             r_mlp, ir_mlp = cd_mlp(r_ln2, ir_ln2, blk)
             r = r_mid + r_mlp; ir = ir_mid + ir_mlp; _normalize(r, ir)
 
         ln_f = model.ln_final
-        r_ln, ir_ln = cd_layer_norm(r, ir, ln_f.w, ln_f.b, eps=_get_eps(ln_f))
+        r_ln, ir_ln = cd_layer_norm(r, ir, *_ln_params(ln_f))
         r_logits, _ = cd_linear(r_ln, ir_ln, model.unembed.W_U, model.unembed.b_U)
         scores[src_fwd, -1] += _l1(r_logits, pos_mask)
 
@@ -306,7 +325,7 @@ def cd_edge_scores(
                 irrel = resid_mid[l] - head_out
 
                 blk = model.blocks[l]
-                r_ln2, ir_ln2 = cd_layer_norm(rel, irrel, blk.ln2.w, blk.ln2.b, eps=_get_eps(blk.ln2))
+                r_ln2, ir_ln2 = cd_layer_norm(rel, irrel, *_ln_params(blk.ln2))
                 scores[src_fwd, l * (3 * n_heads + 1) + 3 * n_heads] += _l1(r_ln2, pos_mask)
                 r_mlp, ir_mlp = cd_mlp(r_ln2, ir_ln2, blk)
                 r_out = rel + r_mlp; ir_out = irrel + ir_mlp; _normalize(r_out, ir_out)
@@ -365,11 +384,11 @@ def cd_edge_scores_full(
         for l in range(n_layers):
             blk = model.blocks[l]
             r0 = torch.zeros_like(h_total)
-            r_ln, ir_ln = cd_layer_norm(r0, h_total, blk.ln1.w, blk.ln1.b, eps=_get_eps(blk.ln1))
+            r_ln, ir_ln = cd_layer_norm(r0, h_total, *_ln_params(blk.ln1))
             r_attn, ir_attn = cd_attention(r_ln, ir_ln, blk, causal)
             h_mid = h_total + r_attn + ir_attn
             r_ln2, ir_ln2 = cd_layer_norm(r0[:1].expand_as(h_mid), h_mid,
-                                          blk.ln2.w, blk.ln2.b, eps=_get_eps(blk.ln2))
+                                          *_ln_params(blk.ln2))
             r_mlp, ir_mlp = cd_mlp(r_ln2, ir_ln2, blk)
             h_total = h_mid + r_mlp + ir_mlp
             cached.append(h_total.clone())
@@ -394,16 +413,16 @@ def cd_edge_scores_full(
         r, ir = rel, irrel
         for l in range(start_layer, n_layers):
             blk = model.blocks[l]
-            r_ln, ir_ln = cd_layer_norm(r, ir, blk.ln1.w, blk.ln1.b, eps=_get_eps(blk.ln1))
+            r_ln, ir_ln = cd_layer_norm(r, ir, *_ln_params(blk.ln1))
             _score_qkv(r_ln, ir_ln, l, src_fwd)
             r_attn, ir_attn = cd_attention(r_ln, ir_ln, blk, causal)
             r_mid = r + r_attn; ir_mid = ir + ir_attn; _normalize(r_mid, ir_mid)
-            r_ln2, ir_ln2 = cd_layer_norm(r_mid, ir_mid, blk.ln2.w, blk.ln2.b, eps=_get_eps(blk.ln2))
+            r_ln2, ir_ln2 = cd_layer_norm(r_mid, ir_mid, *_ln_params(blk.ln2))
             scores[src_fwd, l * (3 * n_heads + 1) + 3 * n_heads] += _l1(r_ln2, pos_mask)
             r_mlp, ir_mlp = cd_mlp(r_ln2, ir_ln2, blk)
             r = r_mid + r_mlp; ir = ir_mid + ir_mlp; _normalize(r, ir)
         ln_f = model.ln_final
-        r_ln, ir_ln = cd_layer_norm(r, ir, ln_f.w, ln_f.b, eps=_get_eps(ln_f))
+        r_ln, ir_ln = cd_layer_norm(r, ir, *_ln_params(ln_f))
         r_logits, _ = cd_linear(r_ln, ir_ln, model.unembed.W_U, model.unembed.b_U)
         scores[src_fwd, -1] += _l1(r_logits, pos_mask)
 
@@ -424,7 +443,7 @@ def cd_edge_scores_full(
                 ir = base_irrel.clone()
 
                 # LN1 + Attention with head marking
-                r_ln, ir_ln = cd_layer_norm(r, ir, blk.ln1.w, blk.ln1.b, eps=_get_eps(blk.ln1))
+                r_ln, ir_ln = cd_layer_norm(r, ir, *_ln_params(blk.ln1))
                 r_attn, ir_attn = cd_attention_with_mark(
                     r_ln, ir_ln, blk, causal, mark_head=h)
 
@@ -435,7 +454,7 @@ def cd_edge_scores_full(
 
                 # Score MLP destination at this layer
                 r_ln2, ir_ln2 = cd_layer_norm(
-                    r_mid, ir_mid, blk.ln2.w, blk.ln2.b, eps=_get_eps(blk.ln2))
+                    r_mid, ir_mid, *_ln_params(blk.ln2))
                 scores[src_fwd, l * (3 * n_heads + 1) + 3 * n_heads] += _l1(r_ln2, pos_mask)
 
                 # MLP + residual
@@ -453,7 +472,7 @@ def cd_edge_scores_full(
             ir = base_irrel.clone()
 
             # LN1 + Attention (no marking — everything stays irrel through attn)
-            r_ln, ir_ln = cd_layer_norm(r, ir, blk.ln1.w, blk.ln1.b, eps=_get_eps(blk.ln1))
+            r_ln, ir_ln = cd_layer_norm(r, ir, *_ln_params(blk.ln1))
             r_attn, ir_attn = cd_attention(r_ln, ir_ln, blk, causal)
             r_mid = r + r_attn
             ir_mid = ir + ir_attn
@@ -461,7 +480,7 @@ def cd_edge_scores_full(
 
             # LN2 + MLP
             r_ln2, ir_ln2 = cd_layer_norm(
-                r_mid, ir_mid, blk.ln2.w, blk.ln2.b, eps=_get_eps(blk.ln2))
+                r_mid, ir_mid, *_ln_params(blk.ln2))
             r_mlp, ir_mlp = cd_mlp(r_ln2, ir_ln2, blk)
 
             # Mark: move total MLP output into rel
