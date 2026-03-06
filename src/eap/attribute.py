@@ -424,7 +424,7 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
                       metric: Callable[[Tensor], Tensor],
                       use_gim_grad: bool = True,
                       filter_quantile: float = 0.35,
-                      filter_mode: Literal['proximity', 'norm', 'cosine', 'logit', 'random', 'none'] = 'proximity',
+                      filter_mode: Literal['proximity', 'norm', 'cosine', 'logit', 'logit*proximity', 'random', 'none'] = 'proximity',
                       quiet: bool = False) -> torch.Tensor:
     """Gets scores using PF-GIM: Proximity-Filtered GIM.
 
@@ -450,6 +450,7 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
             'norm' - L1 norm of source contributions
             'cosine' - cosine similarity to destination residual
             'logit' - logit-space importance via unembedding projection
+            'logit*proximity' - product of logit and proximity scores
             'random' - random scores (control)
             'none' - no filtering (pure gradient)
         quiet: suppress tqdm output
@@ -461,7 +462,7 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
     n_layers = graph.cfg['n_layers']
     n_heads = graph.cfg['n_heads']
     needs_filter_scores = filter_mode not in ('none', 'random')
-    needs_local_filter = filter_mode in ('proximity', 'norm', 'cosine')
+    needs_local_filter = filter_mode in ('proximity', 'norm', 'cosine', 'logit*proximity')
 
     scores_grad = torch.zeros((graph.n_forward, graph.n_backward), device=device, dtype=model.cfg.dtype)
     scores_prox = torch.zeros_like(scores_grad) if needs_filter_scores else None
@@ -501,7 +502,7 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
             if ref.ndim == 4:  # split QKV: (batch, pos, n_heads, d_model)
                 ref = ref[:, :, 0, :]
             contribs = source_acts_clean[:, :, :prev_index]
-            if filter_mode == 'proximity':
+            if filter_mode in ('proximity', 'logit*proximity'):
                 ep = compute_proximity_scores(contribs, ref, input_lengths)
             elif filter_mode == 'norm':
                 ep = compute_norm_scores(contribs, input_lengths)
@@ -614,13 +615,17 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
         model.zero_grad()
 
         # Logit filter: compute per-source scores via unembedding projection
-        if filter_mode == 'logit' and source_acts_clean is not None:
+        if filter_mode in ('logit', 'logit*proximity') and source_acts_clean is not None:
             pred_tokens = clean_logits[
                 torch.arange(batch_size, device=device), input_lengths - 1
             ].argmax(dim=-1)
             ls = compute_logit_scores(
                 source_acts_clean, model.unembed.W_U, input_lengths, pred_tokens)
-            scores_prox += ls.unsqueeze(1).expand_as(scores_prox)
+            ls_expanded = ls.unsqueeze(1).expand_as(scores_prox)
+            if filter_mode == 'logit':
+                scores_prox += ls_expanded
+            else:  # logit*proximity: proximity already accumulated, multiply by logit
+                scores_prox *= ls_expanded
 
         del activation_difference
         if source_acts_clean is not None:
@@ -711,7 +716,7 @@ def get_scores_gim_ig(model: HookedTransformer, graph: Graph, dataloader: DataLo
 
 def _compute_filter_scores(
     model: HookedTransformer, graph: Graph, dataloader: DataLoader,
-    filter_mode: Literal['proximity', 'norm', 'cosine', 'logit'],
+    filter_mode: Literal['proximity', 'norm', 'cosine', 'logit', 'logit*proximity'],
     quiet: bool = False,
 ) -> torch.Tensor:
     """Compute structural filter scores via a single forward pass with hooks.
@@ -726,7 +731,7 @@ def _compute_filter_scores(
     """
     device = _model_device(model)
     n_layers = graph.cfg['n_layers']
-    is_local_filter = filter_mode in ('proximity', 'norm', 'cosine')
+    is_local_filter = filter_mode in ('proximity', 'norm', 'cosine', 'logit*proximity')
 
     scores_filt = torch.zeros((graph.n_forward, graph.n_backward), device=device, dtype=model.cfg.dtype)
 
@@ -749,7 +754,7 @@ def _compute_filter_scores(
             if ref.ndim == 4:
                 ref = ref[:, :, 0, :]
             contribs = source_acts_clean[:, :, :prev_index]
-            if filter_mode == 'proximity':
+            if filter_mode in ('proximity', 'logit*proximity'):
                 ep = compute_proximity_scores(contribs, ref, input_lengths)
             elif filter_mode == 'norm':
                 ep = compute_norm_scores(contribs, input_lengths)
@@ -803,13 +808,17 @@ def _compute_filter_scores(
                 logits = model(clean_tokens, attention_mask=attention_mask)
 
         # Logit filter: compute per-source scores via unembedding projection
-        if filter_mode == 'logit':
+        if filter_mode in ('logit', 'logit*proximity'):
             pred_tokens = logits[
                 torch.arange(batch_size, device=device), input_lengths - 1
             ].argmax(dim=-1)
             ls = compute_logit_scores(
                 source_acts_clean, model.unembed.W_U, input_lengths, pred_tokens)
-            scores_filt += ls.unsqueeze(1).expand_as(scores_filt)
+            ls_expanded = ls.unsqueeze(1).expand_as(scores_filt)
+            if filter_mode == 'logit':
+                scores_filt += ls_expanded
+            else:  # logit*proximity
+                scores_filt *= ls_expanded
 
         del source_acts_clean
         if torch.cuda.is_available():
@@ -822,7 +831,7 @@ def _compute_filter_scores(
 def get_scores_pf_gim_ig(model: HookedTransformer, graph: Graph, dataloader: DataLoader,
                           metric: Callable[[Tensor], Tensor],
                           filter_quantile: float = 0.35,
-                          filter_mode: Literal['proximity', 'norm', 'cosine', 'logit', 'random', 'none'] = 'proximity',
+                          filter_mode: Literal['proximity', 'norm', 'cosine', 'logit', 'logit*proximity', 'random', 'none'] = 'proximity',
                           ig_steps: int = 5,
                           quiet: bool = False) -> torch.Tensor:
     """Gets scores using PF-GIM-IG: Proximity-filtered GIM-corrected integrated gradients.
@@ -868,7 +877,7 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
               intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', aggregation='sum',
               ig_steps: Optional[int]=None, intervention_dataloader: Optional[DataLoader]=None, quiet=False,
               pf_gim_use_gim_grad: bool = True, pf_gim_filter_quantile: float = 0.35,
-              pf_gim_filter_mode: Literal['proximity', 'norm', 'cosine', 'logit', 'random', 'none'] = 'proximity'):
+              pf_gim_filter_mode: Literal['proximity', 'norm', 'cosine', 'logit', 'logit*proximity', 'random', 'none'] = 'proximity'):
     assert model.cfg.use_attn_result, "Model must be configured to use attention result (model.cfg.use_attn_result)"
     assert model.cfg.use_split_qkv_input, "Model must be configured to use split qkv inputs (model.cfg.use_split_qkv_input)"
     assert model.cfg.use_hook_mlp_in, "Model must be configured to use hook MLP in (model.cfg.use_hook_mlp_in)"
