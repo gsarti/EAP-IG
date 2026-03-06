@@ -11,8 +11,8 @@ from tqdm import tqdm
 from .utils import tokenize_plus, make_hooks_and_matrices, compute_mean_activations
 from .evaluate import evaluate_graph, evaluate_baseline
 from .graph import Graph
-from .gwai import (
-    compute_edge_gradient_scores, compute_combined_scores,
+from .pf_gim import (
+    compute_edge_gradient_scores,
     compute_proximity_scores, make_names_filter,
     _propagate_chunked_attention, _propagate_chunked_mlp,
 )
@@ -423,46 +423,28 @@ def get_scores_information_flow_routes(model: HookedTransformer, graph: Graph, d
 
     return scores
 
-def get_scores_gwai(model: HookedTransformer, graph: Graph, dataloader: DataLoader,
-                    metric: Callable[[Tensor], Tensor],
-                    scoring: Literal['combined', 'gradient', 'proximity', 'additive', 'filtered'] = 'combined',
-                    incremental: bool = True,
-                    use_gim_grad: bool = True,
-                    proximity_norm: Literal['sum', 'max'] = 'max',
-                    alpha: float = 0.7,
-                    filter_quantile: float = 0.5,
-                    tsg_temperature: float = 2.0, scale_multiplicative: bool = True,
-                    chunk_size: int = 8, quiet: bool = False) -> torch.Tensor:
-    """Gets scores using GWAI: Gradient-Weighted ALTI Interactions.
+def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLoader,
+                      metric: Callable[[Tensor], Tensor],
+                      use_gim_grad: bool = True,
+                      filter_quantile: float = 0.35,
+                      incremental: bool = False,
+                      tsg_temperature: float = 2.0, scale_multiplicative: bool = True,
+                      chunk_size: int = 8, quiet: bool = False) -> torch.Tensor:
+    """Gets scores using PF-GIM: Proximity-Filtered GIM.
 
-    Uses counterfactual activation differences (corrupted - clean) for gradient-
-    based scoring, and clean source contributions for proximity weighting.
-    When incremental=True, activation differences are propagated through each
-    layer via GIM-corrected JVPs, accounting for self-repair effects.
-
-    Scoring modes:
-      - 'gradient': counterfactual gradient projection ((z_j^corr - z_j^clean) · grad).
-      - 'proximity': ALTI proximity metric (geometric, task-agnostic, no corrupted pass).
-      - 'combined': proximity-weighted gradient. Uses proximity_norm to control how
-        proximity weights are normalized ('max' recommended, 'sum' is ALTI default).
-      - 'additive': z-score normalized additive fusion.
-        score = α × z(gradient) + (1-α) × z(proximity). Both signals contribute
-        proportionally without one zeroing out the other.
-      - 'filtered': gradient scores masked by proximity threshold. Edges with
-        proximity below the filter_quantile are zeroed. Gradient provides
-        ranking, proximity provides structural plausibility filtering.
+    Computes GIM-corrected gradient scores (activation_diff × GIM_grad) for all
+    edges, then filters out structurally implausible edges using ALTI proximity.
+    Edges with proximity below a quantile threshold are zeroed out. Gradient
+    provides ranking, proximity provides structural plausibility filtering.
 
     Args:
         model: the model to attribute
         graph: the graph to attribute
         dataloader: the data over which to attribute
-        metric: the metric to attribute w.r.t. (needed for gradient-based scoring)
-        scoring: scoring mode (see above)
-        incremental: whether to propagate through layers via GIM JVPs
+        metric: the metric to attribute w.r.t.
         use_gim_grad: use GIM-corrected gradients (frozen LN, TSG softmax, Shapley)
-        proximity_norm: 'max' or 'sum' normalization for proximity in combined mode
-        alpha: gradient weight for additive mode (proximity weight = 1 - alpha)
-        filter_quantile: quantile threshold for filtered mode (0.5 = median)
+        filter_quantile: quantile threshold for proximity filtering (default 0.35)
+        incremental: whether to propagate through layers via GIM JVPs
         tsg_temperature: temperature for TSG softmax correction (default 2.0)
         scale_multiplicative: whether to apply Shapley /2 at multiplicative junctions
         chunk_size: number of source nodes to process simultaneously in JVP
@@ -472,21 +454,13 @@ def get_scores_gwai(model: HookedTransformer, graph: Graph, dataloader: DataLoad
         Tensor: a [src_nodes, dst_nodes] tensor of scores for each edge
     """
     device = _model_device(model)
-    scores = torch.zeros((graph.n_forward, graph.n_backward), device=device, dtype=model.cfg.dtype)
-
-    needs_grad = scoring in ('combined', 'gradient', 'additive', 'filtered')
-    needs_diff = needs_grad  # activation diffs needed for gradient-based scoring
-    needs_prox = scoring in ('combined', 'proximity', 'additive', 'filtered')
     names_filter = make_names_filter(model, needs_jvp=incremental)
     n_layers = graph.cfg['n_layers']
     n_heads = graph.cfg['n_heads']
     parallel = model.cfg.parallel_attn_mlp
 
-    # For additive/filtered modes, accumulate gradient and proximity scores separately
-    scores_grad = scores_prox = None
-    if scoring in ('additive', 'filtered'):
-        scores_grad = torch.zeros_like(scores)
-        scores_prox = torch.zeros_like(scores)
+    scores_grad = torch.zeros((graph.n_forward, graph.n_backward), device=device, dtype=model.cfg.dtype)
+    scores_prox = torch.zeros_like(scores_grad)
 
     total_items = 0
     dataloader_iter = dataloader if quiet else tqdm(dataloader)
@@ -501,58 +475,55 @@ def get_scores_gwai(model: HookedTransformer, graph: Graph, dataloader: DataLoad
                                             names_filter=names_filter)
 
         # --- Corrupted forward pass (source outputs only) ---
-        corrupted_cache = None
-        if needs_diff:
-            corrupted_tokens, _, _, _ = tokenize_plus(model, corrupted)
-            _src_hooks = {'hook_embed'}
-            for _l in range(n_layers):
-                _src_hooks.add(f'blocks.{_l}.attn.hook_result')
-                _src_hooks.add(f'blocks.{_l}.hook_mlp_out')
-            with torch.inference_mode():
-                _, corrupted_cache = model.run_with_cache(
-                    corrupted_tokens, attention_mask=attention_mask,
-                    names_filter=lambda name: name in _src_hooks)
+        corrupted_tokens, _, _, _ = tokenize_plus(model, corrupted)
+        _src_hooks = {'hook_embed'}
+        for _l in range(n_layers):
+            _src_hooks.add(f'blocks.{_l}.attn.hook_result')
+            _src_hooks.add(f'blocks.{_l}.hook_mlp_out')
+        with torch.inference_mode():
+            _, corrupted_cache = model.run_with_cache(
+                corrupted_tokens, attention_mask=attention_mask,
+                names_filter=lambda name: name in _src_hooks)
 
         # --- Compute task gradients at each destination input ---
-        grad_at = {}  # key -> gradient tensor
-        if needs_grad:
-            saved_acts = {}
-            def make_save_hook(key):
-                def hook_fn(activations, hook):
-                    activations.retain_grad()
-                    saved_acts[key] = activations
-                    return activations
-                return hook_fn
+        grad_at = {}
+        saved_acts = {}
+        def make_save_hook(key):
+            def hook_fn(activations, hook):
+                activations.retain_grad()
+                saved_acts[key] = activations
+                return activations
+            return hook_fn
 
-            fwd_hooks = []
-            for layer in range(n_layers):
-                attn_node = graph.nodes[f'a{layer}.h0']
-                for i, letter in enumerate('qkv'):
-                    hook_name = attn_node.qkv_inputs[i]
-                    fwd_hooks.append((hook_name, make_save_hook((layer, letter))))
-                mlp_node = graph.nodes[f'm{layer}']
-                fwd_hooks.append((mlp_node.in_hook, make_save_hook((layer, 'mlp'))))
-            logit_node = graph.nodes['logits']
-            fwd_hooks.append((logit_node.in_hook, make_save_hook('logits')))
+        fwd_hooks = []
+        for layer in range(n_layers):
+            attn_node = graph.nodes[f'a{layer}.h0']
+            for i, letter in enumerate('qkv'):
+                hook_name = attn_node.qkv_inputs[i]
+                fwd_hooks.append((hook_name, make_save_hook((layer, letter))))
+            mlp_node = graph.nodes[f'm{layer}']
+            fwd_hooks.append((mlp_node.in_hook, make_save_hook((layer, 'mlp'))))
+        logit_node = graph.nodes['logits']
+        fwd_hooks.append((logit_node.in_hook, make_save_hook('logits')))
 
-            def _run_backward():
-                with model.hooks(fwd_hooks=fwd_hooks):
-                    logits = model(clean_tokens, attention_mask=attention_mask)
-                    clean_logits = logits.detach()
-                    metric_value = metric(logits, clean_logits, input_lengths, label)
-                    metric_value.backward()
+        def _run_backward():
+            with model.hooks(fwd_hooks=fwd_hooks):
+                logits = model(clean_tokens, attention_mask=attention_mask)
+                clean_logits = logits.detach()
+                metric_value = metric(logits, clean_logits, input_lengths, label)
+                metric_value.backward()
 
-            if use_gim_grad:
-                import gim
-                with gim.GIM(model):
-                    _run_backward()
-            else:
+        if use_gim_grad:
+            import gim
+            with gim.GIM(model):
                 _run_backward()
+        else:
+            _run_backward()
 
-            for key, act in saved_acts.items():
-                if act.grad is not None:
-                    grad_at[key] = act.grad.detach()
-            model.zero_grad()
+        for key, act in saved_acts.items():
+            if act.grad is not None:
+                grad_at[key] = act.grad.detach()
+        model.zero_grad()
 
         # --- Build source activation tensors ---
         def _build_source_acts(src_cache):
@@ -568,18 +539,12 @@ def get_scores_gwai(model: HookedTransformer, graph: Graph, dataloader: DataLoad
                 sa[:, :, _mi] = src_cache[f'blocks.{_l}.hook_mlp_out']
             return sa
 
-        # Clean source contributions (for proximity weighting)
         source_acts_clean = _build_source_acts(cache)
+        source_acts_diff = _build_source_acts(corrupted_cache) - source_acts_clean
+        del corrupted_cache
 
-        # Activation differences: corrupted - clean (for gradient scoring)
-        source_acts_diff = None
-        if needs_diff:
-            source_acts_diff = _build_source_acts(corrupted_cache) - source_acts_clean
-            del corrupted_cache
-
-        # --- Incremental scoring ---
+        # --- Score each destination ---
         def _add_to_scores(target, prev_idx, bwd_idx, edge_scores, is_attn=False):
-            """Add edge scores to the target tensor, broadcasting for attention."""
             if is_attn:
                 if edge_scores.ndim == 1:
                     target[:prev_idx, bwd_idx] += edge_scores.unsqueeze(1).expand(-1, n_heads)
@@ -588,161 +553,71 @@ def get_scores_gwai(model: HookedTransformer, graph: Graph, dataloader: DataLoad
             else:
                 target[:prev_idx, bwd_idx] += edge_scores
 
-        def _compute_grad_and_prox(prev_idx, grad_key, ref):
-            """Compute gradient and proximity scores for additive/filtered modes."""
-            eg = compute_edge_gradient_scores(
-                source_acts_diff[:, :, :prev_idx], grad_at[grad_key], input_lengths)
+        def _score_dest(prev_idx, bwd_idx, grad_key, ref, is_attn=False):
+            if grad_key in grad_at:
+                eg = compute_edge_gradient_scores(
+                    source_acts_diff[:, :, :prev_idx], grad_at[grad_key], input_lengths)
+                _add_to_scores(scores_grad, prev_idx, bwd_idx, eg, is_attn=is_attn)
             ep = compute_proximity_scores(
                 source_acts_clean[:, :, :prev_idx], ref, input_lengths)
-            return eg, ep
-
-        def _score_attn_dest(layer, letter, prev_idx):
-            """Score sources -> attention Q/K/V destination."""
-            attn_n = graph.nodes[f'a{layer}.h0']
-            key = (layer, letter)
-            bwd_idx = graph.backward_index(attn_n, qkv=letter)
-            ref = cache[f'blocks.{layer}.hook_resid_pre']
-
-            if scoring in ('additive', 'filtered') and key in grad_at:
-                eg, ep = _compute_grad_and_prox(prev_idx, key, ref)
-                _add_to_scores(scores_grad, prev_idx, bwd_idx, eg, is_attn=True)
-                _add_to_scores(scores_prox, prev_idx, bwd_idx, ep, is_attn=True)
-            elif scoring == 'combined' and key in grad_at:
-                edge_scores = compute_combined_scores(
-                    source_acts_clean[:, :, :prev_idx],
-                    source_acts_diff[:, :, :prev_idx],
-                    ref, grad_at[key], input_lengths, proximity_norm=proximity_norm)
-                _add_to_scores(scores, prev_idx, bwd_idx, edge_scores, is_attn=True)
-            elif scoring == 'gradient' and key in grad_at:
-                edge_scores = compute_edge_gradient_scores(
-                    source_acts_diff[:, :, :prev_idx], grad_at[key], input_lengths)
-                _add_to_scores(scores, prev_idx, bwd_idx, edge_scores, is_attn=True)
-            else:  # proximity
-                importance = compute_proximity_scores(
-                    source_acts_clean[:, :, :prev_idx], ref, input_lengths)
-                _add_to_scores(scores, prev_idx, bwd_idx, importance, is_attn=True)
-
-        def _score_mlp_dest(layer, prev_idx):
-            """Score sources -> MLP destination."""
-            mlp_n = graph.nodes[f'm{layer}']
-            bwd_idx = graph.backward_index(mlp_n)
-            ref = (cache[f'blocks.{layer}.hook_resid_mid'] if not parallel
-                   else cache[f'blocks.{layer}.hook_resid_pre'])
-
-            if scoring in ('additive', 'filtered') and (layer, 'mlp') in grad_at:
-                eg, ep = _compute_grad_and_prox(prev_idx, (layer, 'mlp'), ref)
-                scores_grad[:prev_idx, bwd_idx] += eg
-                scores_prox[:prev_idx, bwd_idx] += ep
-            elif scoring == 'combined' and (layer, 'mlp') in grad_at:
-                edge_scores = compute_combined_scores(
-                    source_acts_clean[:, :, :prev_idx],
-                    source_acts_diff[:, :, :prev_idx],
-                    ref, grad_at[(layer, 'mlp')], input_lengths, proximity_norm=proximity_norm)
-                scores[:prev_idx, bwd_idx] += edge_scores
-            elif scoring == 'gradient' and (layer, 'mlp') in grad_at:
-                edge_scores = compute_edge_gradient_scores(
-                    source_acts_diff[:, :, :prev_idx], grad_at[(layer, 'mlp')], input_lengths)
-                scores[:prev_idx, bwd_idx] += edge_scores
-            else:  # proximity
-                edge_scores = compute_proximity_scores(
-                    source_acts_clean[:, :, :prev_idx], ref, input_lengths)
-                scores[:prev_idx, bwd_idx] += edge_scores
+            _add_to_scores(scores_prox, prev_idx, bwd_idx, ep, is_attn=is_attn)
 
         for layer in range(n_layers):
             attn_node = graph.nodes[f'a{layer}.h0']
             prev_index = graph.prev_index(attn_node)
 
             if prev_index > 0:
+                ref = cache[f'blocks.{layer}.hook_resid_pre']
                 for letter in 'qkv':
-                    _score_attn_dest(layer, letter, prev_index)
+                    bwd_idx = graph.backward_index(attn_node, qkv=letter)
+                    _score_dest(prev_index, bwd_idx, (layer, letter), ref, is_attn=True)
 
-            # Propagate through attention of this layer
             if incremental:
                 n_src_before_attn = graph.prev_index(attn_node)
                 if n_src_before_attn > 0:
                     with torch.inference_mode():
-                        if needs_diff:
-                            source_acts_diff = _propagate_chunked_attention(
-                                source_acts_diff, n_src_before_attn, layer, model, cache,
-                                tsg_temperature, scale_multiplicative, chunk_size)
-                        else:
-                            source_acts_clean = _propagate_chunked_attention(
-                                source_acts_clean, n_src_before_attn, layer, model, cache,
-                                tsg_temperature, scale_multiplicative, chunk_size)
+                        source_acts_diff = _propagate_chunked_attention(
+                            source_acts_diff, n_src_before_attn, layer, model, cache,
+                            tsg_temperature, scale_multiplicative, chunk_size)
 
-            # --- MLP destination ---
             mlp_node = graph.nodes[f'm{layer}']
             prev_index_mlp = graph.prev_index(mlp_node)
 
             if prev_index_mlp > 0:
-                _score_mlp_dest(layer, prev_index_mlp)
+                bwd_idx = graph.backward_index(mlp_node)
+                ref = (cache[f'blocks.{layer}.hook_resid_mid'] if not parallel
+                       else cache[f'blocks.{layer}.hook_resid_pre'])
+                _score_dest(prev_index_mlp, bwd_idx, (layer, 'mlp'), ref)
 
-            # Propagate through MLP of this layer
             if incremental:
                 n_src_before_mlp = graph.prev_index(mlp_node)
                 if n_src_before_mlp > 0:
                     with torch.inference_mode():
-                        if needs_diff:
-                            source_acts_diff = _propagate_chunked_mlp(
-                                source_acts_diff, n_src_before_mlp, layer, model, cache,
-                                scale_multiplicative, chunk_size)
-                        else:
-                            source_acts_clean = _propagate_chunked_mlp(
-                                source_acts_clean, n_src_before_mlp, layer, model, cache,
-                                scale_multiplicative, chunk_size)
+                        source_acts_diff = _propagate_chunked_mlp(
+                            source_acts_diff, n_src_before_mlp, layer, model, cache,
+                            scale_multiplicative, chunk_size)
 
         # --- Logits destination ---
         logit_node = graph.nodes['logits']
         prev_index_logits = graph.prev_index(logit_node)
         bwd_idx_logits = graph.backward_index(logit_node)
         ref_logits = cache[f'blocks.{n_layers - 1}.hook_resid_post']
+        _score_dest(prev_index_logits, bwd_idx_logits, 'logits', ref_logits)
 
-        if scoring in ('additive', 'filtered') and 'logits' in grad_at:
-            eg, ep = _compute_grad_and_prox(prev_index_logits, 'logits', ref_logits)
-            scores_grad[:prev_index_logits, bwd_idx_logits] += eg
-            scores_prox[:prev_index_logits, bwd_idx_logits] += ep
-        elif scoring == 'combined' and 'logits' in grad_at:
-            importance_logits = compute_combined_scores(
-                source_acts_clean[:, :, :prev_index_logits],
-                source_acts_diff[:, :, :prev_index_logits],
-                ref_logits, grad_at['logits'], input_lengths, proximity_norm=proximity_norm)
-            scores[:prev_index_logits, bwd_idx_logits] += importance_logits
-        elif scoring == 'gradient' and 'logits' in grad_at:
-            importance_logits = compute_edge_gradient_scores(
-                source_acts_diff[:, :, :prev_index_logits], grad_at['logits'], input_lengths)
-            scores[:prev_index_logits, bwd_idx_logits] += importance_logits
-        else:  # proximity
-            importance_logits = compute_proximity_scores(
-                source_acts_clean[:, :, :prev_index_logits], ref_logits, input_lengths)
-            scores[:prev_index_logits, bwd_idx_logits] += importance_logits
-
-        del cache, source_acts_clean
-        if source_acts_diff is not None:
-            del source_acts_diff
+        del cache, source_acts_clean, source_acts_diff
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # --- Post-processing for additive/filtered modes ---
-    if scoring in ('additive', 'filtered'):
-        scores_grad /= total_items
-        scores_prox /= total_items
+    # --- Proximity-filtered gradient scores ---
+    scores_grad /= total_items
+    scores_prox /= total_items
 
-        if scoring == 'additive':
-            # z-score normalize each signal, then combine
-            g_scale = scores_grad.abs().mean().clamp(min=1e-10)
-            p_scale = scores_prox.abs().mean().clamp(min=1e-10)
-            return alpha * (scores_grad / g_scale) + (1 - alpha) * (scores_prox / p_scale)
-        else:  # filtered
-            # Zero out gradient scores where proximity is below threshold
-            prox_flat = scores_prox[scores_prox > 0]
-            if prox_flat.numel() > 0:
-                threshold = torch.quantile(prox_flat, filter_quantile)
-                mask = scores_prox >= threshold
-                return scores_grad * mask
-            return scores_grad
-
-    scores /= total_items
-    return scores
+    prox_flat = scores_prox[scores_prox > 0]
+    if prox_flat.numel() > 0:
+        threshold = torch.quantile(prox_flat, filter_quantile)
+        mask = scores_prox >= threshold
+        return scores_grad * mask
+    return scores_grad
 
 
 def get_scores_gim(model: HookedTransformer, graph: Graph, dataloader: DataLoader,
@@ -784,15 +659,13 @@ def get_scores_gim(model: HookedTransformer, graph: Graph, dataloader: DataLoade
 
 allowed_aggregations = {'sum', 'mean'}
 def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor],
-              method: Literal['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'GWAI', 'GIM', 'exact'],
+              method: Literal['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'PF-GIM', 'GIM', 'exact'],
               intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', aggregation='sum',
               ig_steps: Optional[int]=None, intervention_dataloader: Optional[DataLoader]=None, quiet=False,
-              gwai_scoring: str = 'combined', gwai_incremental: bool = True,
-              gwai_use_gim_grad: bool = True,
-              gwai_proximity_norm: str = 'max', gwai_alpha: float = 0.7,
-              gwai_filter_quantile: float = 0.5,
-              gwai_tsg_temperature: float = 2.0, gwai_scale_multiplicative: bool = True,
-              gwai_chunk_size: int = 8):
+              pf_gim_use_gim_grad: bool = True, pf_gim_filter_quantile: float = 0.35,
+              pf_gim_incremental: bool = False,
+              pf_gim_tsg_temperature: float = 2.0, pf_gim_scale_multiplicative: bool = True,
+              pf_gim_chunk_size: int = 8):
     assert model.cfg.use_attn_result, "Model must be configured to use attention result (model.cfg.use_attn_result)"
     assert model.cfg.use_split_qkv_input, "Model must be configured to use split qkv inputs (model.cfg.use_split_qkv_input)"
     assert model.cfg.use_hook_mlp_in, "Model must be configured to use hook MLP in (model.cfg.use_hook_mlp_in)"
@@ -820,21 +693,21 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
                                            intervention_dataloader=intervention_dataloader, quiet=quiet)
     elif method == 'information-flow-routes':
         scores = get_scores_information_flow_routes(model, graph, dataloader, quiet=quiet)
-    elif method == 'GWAI':
-        scores = get_scores_gwai(model, graph, dataloader, metric=metric, scoring=gwai_scoring,
-                                 incremental=gwai_incremental, use_gim_grad=gwai_use_gim_grad,
-                                 proximity_norm=gwai_proximity_norm, alpha=gwai_alpha,
-                                 filter_quantile=gwai_filter_quantile,
-                                 tsg_temperature=gwai_tsg_temperature,
-                                 scale_multiplicative=gwai_scale_multiplicative,
-                                 chunk_size=gwai_chunk_size, quiet=quiet)
+    elif method == 'PF-GIM':
+        scores = get_scores_pf_gim(model, graph, dataloader, metric=metric,
+                                   use_gim_grad=pf_gim_use_gim_grad,
+                                   filter_quantile=pf_gim_filter_quantile,
+                                   incremental=pf_gim_incremental,
+                                   tsg_temperature=pf_gim_tsg_temperature,
+                                   scale_multiplicative=pf_gim_scale_multiplicative,
+                                   chunk_size=pf_gim_chunk_size, quiet=quiet)
     elif method == 'GIM':
         scores = get_scores_gim(model, graph, dataloader, metric, quiet=quiet)
     elif method == 'exact':
         scores = get_scores_exact(model, graph, dataloader, metric, intervention=intervention, intervention_dataloader=intervention_dataloader,
                                   quiet=quiet)
     else:
-        raise ValueError(f"method must be in ['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'GWAI', 'GIM', 'exact'], but got {method}")
+        raise ValueError(f"method must be in ['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'PF-GIM', 'GIM', 'exact'], but got {method}")
 
 
     if aggregation == 'mean':

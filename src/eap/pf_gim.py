@@ -1,16 +1,12 @@
-"""GWAI: Gradient-Weighted ALTI Interactions for circuit discovery.
+"""PF-GIM: Proximity-Filtered GIM for circuit discovery.
 
-Combines structural decomposition (which source vectors contribute to the
-residual stream) with task-specific gradients (which directions in the
-residual stream matter for the metric). GIM-corrected JVPs account for
-self-repair effects by propagating contributions through subsequent layers.
+Computes GIM-corrected gradient scores (activation_diff × GIM_grad) for all
+edges, then filters out structurally implausible edges using ALTI proximity.
+Edges with proximity below a quantile threshold are zeroed out. Gradient
+provides ranking, proximity provides structural plausibility filtering.
 
-Two scoring modes:
-  - 'gradient': score = ||z_j^(k) * grad||_1  (gradient-weighted contribution)
-  - 'proximity': score = ALTI proximity metric (purely geometric, task-agnostic)
-
-Incremental propagation: sources are propagated through each layer once and
-scored at each destination along the way, making cost independent of k.
+Also provides GIM-corrected JVP functions for optional incremental propagation
+of activation differences through subsequent layers.
 """
 
 import math
@@ -302,83 +298,6 @@ def _propagate_chunked_mlp(
 # Scoring functions
 # ---------------------------------------------------------------------------
 
-def _raw_proximity(
-    contributions: Tensor,
-    reference: Tensor,
-) -> Tensor:
-    """Compute raw (unnormalized) ALTI proximity per sample and position.
-
-    contributions: (batch, pos, n_src, d_model)
-    reference: (batch, pos, d_model)
-
-    Returns: (batch, pos, n_src) raw proximity values >= 0.
-    """
-    ref_unsq = reference.unsqueeze(2)
-    dist = torch.linalg.vector_norm(contributions - ref_unsq, ord=1, dim=-1)
-    ref_norm = torch.linalg.vector_norm(ref_unsq, ord=1, dim=-1)
-    return torch.clamp(-dist + ref_norm, min=0)
-
-
-def _proximity_per_sample(
-    contributions: Tensor,
-    reference: Tensor,
-    normalization: Literal['sum', 'max'] = 'sum',
-) -> Tensor:
-    """Compute normalized ALTI proximity per sample and position (no aggregation).
-
-    contributions: (batch, pos, n_src, d_model)
-    reference: (batch, pos, d_model)
-    normalization: 'sum' (ALTI default, weights sum to 1) or
-                   'max' (weights in [0, 1], divided by per-position max)
-
-    Returns: (batch, pos, n_src) normalized proximity weights.
-    """
-    proximity = _raw_proximity(contributions, reference)
-    if normalization == 'max':
-        denom = proximity.max(dim=2, keepdim=True).values.clamp(min=1e-10)
-    else:
-        denom = proximity.sum(dim=2, keepdim=True).clamp(min=1e-10)
-    return proximity / denom
-
-
-def _gradient_projection_per_sample(
-    contributions: Tensor,
-    grad: Tensor,
-) -> Tensor:
-    """Compute per-sample gradient projection (no aggregation).
-
-    contributions: (batch, pos, n_src, d_model)
-    grad: (batch, pos, d_model) or (batch, pos, n_heads, d_model)
-
-    Returns: (batch, pos, n_src) or (batch, pos, n_src, n_heads)
-    """
-    if grad.ndim == 4:
-        return torch.einsum('bpsd,bphd->bpsh', contributions, grad)
-    return (contributions * grad.unsqueeze(2)).sum(dim=-1)
-
-
-def _mask_and_aggregate(
-    scores: Tensor,
-    input_lengths: Tensor,
-) -> Tensor:
-    """Mask padding positions and aggregate over positions and batch.
-
-    scores: (batch, pos, n_src, ...) — may have trailing n_heads dim
-    input_lengths: (batch,)
-
-    Returns: (n_src,) or (n_src, n_heads)
-    """
-    max_len = input_lengths.max()
-    mask = torch.arange(max_len, device=input_lengths.device, dtype=input_lengths.dtype
-                        ).expand(len(input_lengths), max_len) < input_lengths.unsqueeze(1)
-    # expand mask to match scores dims
-    for _ in range(scores.ndim - 2):
-        mask = mask.unsqueeze(-1)
-    scores = scores * mask
-    scores = scores.sum(dim=1)  # sum over positions
-    return scores.sum(dim=0)    # sum over batch
-
-
 def compute_edge_gradient_scores(
     contributions: Tensor,
     grad: Tensor,
@@ -394,48 +313,19 @@ def compute_edge_gradient_scores(
 
     Returns: (n_src,) or (n_src, n_heads)
     """
-    scores = _gradient_projection_per_sample(contributions, grad)
-    return _mask_and_aggregate(scores, input_lengths)
-
-
-def compute_combined_scores(
-    contributions_prox: Tensor,
-    contributions_grad: Tensor,
-    reference: Tensor,
-    grad: Tensor,
-    input_lengths: Tensor,
-    proximity_norm: Literal['sum', 'max'] = 'max',
-) -> Tensor:
-    """Score edges by proximity-weighted gradient projection (GWAI).
-
-    Per position and sample:
-      score_j = proximity(z_j^clean, y^clean) × ((z_j^corr - z_j^clean) · grad_dest)
-
-    ALTI proximity on clean sources provides structural weights, gradient
-    projection on activation differences provides the counterfactual task signal.
-
-    contributions_prox: (batch, pos, n_src, d_model) — clean sources for proximity
-    contributions_grad: (batch, pos, n_src, d_model) — activation diffs for gradient
-    reference: (batch, pos, d_model) — clean residual stream
-    grad: (batch, pos, d_model) or (batch, pos, n_heads, d_model)
-    input_lengths: (batch,)
-    proximity_norm: 'sum' (ALTI default) or 'max' (softer, recommended)
-
-    Returns: (n_src,) or (n_src, n_heads)
-    """
-    proximity = _proximity_per_sample(contributions_prox, reference,
-                                      normalization=proximity_norm)
-    grad_proj = _gradient_projection_per_sample(contributions_grad, grad)
-
-    per_head = grad.ndim == 4
-    if per_head:
-        # proximity: (batch, pos, n_src) -> (batch, pos, n_src, 1)
-        # grad_proj: (batch, pos, n_src, n_heads)
-        combined = proximity.unsqueeze(-1) * grad_proj
+    if grad.ndim == 4:
+        scores = torch.einsum('bpsd,bphd->bpsh', contributions, grad)
     else:
-        combined = proximity * grad_proj  # (batch, pos, n_src)
+        scores = (contributions * grad.unsqueeze(2)).sum(dim=-1)
 
-    return _mask_and_aggregate(combined, input_lengths)
+    max_len = input_lengths.max()
+    mask = torch.arange(max_len, device=input_lengths.device, dtype=input_lengths.dtype
+                        ).expand(len(input_lengths), max_len) < input_lengths.unsqueeze(1)
+    for _ in range(scores.ndim - 2):
+        mask = mask.unsqueeze(-1)
+    scores = scores * mask
+    scores = scores.sum(dim=1)
+    return scores.sum(dim=0)
 
 
 def compute_proximity_scores(
