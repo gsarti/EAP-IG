@@ -100,24 +100,23 @@ def compute_logit_scores(
     contributions: Tensor,
     W_U: Tensor,
     input_lengths: Tensor,
-    chunk_size: int = 8,
+    target_tokens: Tensor,
 ) -> Tensor:
-    """Logit-space importance via unembedding projection at output position.
+    """Logit-space importance: contribution to predicted token's logit.
 
-    Projects each source's contribution at the output (last non-padding) position
-    through the unembedding matrix, then takes the L1 norm of the resulting logit
-    vector. Measures how much each source "votes" in logit space, following
-    Ferrando et al. (ACL 2023).
+    For each source, computes how much its contribution at the output position
+    pushes the logit of the predicted token, following Ferrando et al. (ACL 2023).
+    Uses the dot product with the target token's unembedding vector rather than
+    the full vocab projection, making it both efficient and discriminative.
 
     contributions: (batch, pos, n_src, d_model)
     W_U: (d_model, d_vocab)
     input_lengths: (batch,)
-    chunk_size: number of sources to project at once (controls peak memory)
+    target_tokens: (batch,) predicted token indices
 
     Returns: (n_src,) scores aggregated over batch.
     """
     batch_size = contributions.shape[0]
-    n_src = contributions.shape[2]
     device = contributions.device
 
     # Get output position contributions: (batch, n_src, d_model)
@@ -126,12 +125,11 @@ def compute_logit_scores(
         torch.arange(batch_size, device=device), output_idx
     ]
 
-    # Process in chunks to avoid materializing (batch, n_src, d_vocab) at once
-    scores = torch.zeros(n_src, device=device, dtype=contributions.dtype)
-    for start in range(0, n_src, chunk_size):
-        end = min(start + chunk_size, n_src)
-        chunk = output_contribs[:, start:end]       # (batch, chunk, d_model)
-        logit_chunk = chunk @ W_U                    # (batch, chunk, d_vocab)
-        scores[start:end] = logit_chunk.abs().sum(dim=-1).sum(dim=0)
+    # Get unembedding vectors for target tokens: (batch, d_model)
+    target_unembed = W_U[:, target_tokens].T
 
-    return scores
+    # Dot product: how much each source pushes the predicted token's logit
+    # (batch, n_src, d_model) × (batch, 1, d_model) -> (batch, n_src)
+    logit_contribs = torch.einsum('bsd,bd->bs', output_contribs, target_unembed)
+
+    return logit_contribs.abs().sum(dim=0)

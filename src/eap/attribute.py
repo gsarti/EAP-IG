@@ -615,7 +615,11 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
 
         # Logit filter: compute per-source scores via unembedding projection
         if filter_mode == 'logit' and source_acts_clean is not None:
-            ls = compute_logit_scores(source_acts_clean, model.unembed.W_U, input_lengths)
+            pred_tokens = clean_logits[
+                torch.arange(batch_size, device=device), input_lengths - 1
+            ].argmax(dim=-1)
+            ls = compute_logit_scores(
+                source_acts_clean, model.unembed.W_U, input_lengths, pred_tokens)
             scores_prox += ls.unsqueeze(1).expand_as(scores_prox)
 
         del activation_difference
@@ -796,11 +800,15 @@ def _compute_filter_scores(
 
         with torch.inference_mode():
             with model.hooks(fwd_hooks=fwd_hooks):
-                model(clean_tokens, attention_mask=attention_mask)
+                logits = model(clean_tokens, attention_mask=attention_mask)
 
         # Logit filter: compute per-source scores via unembedding projection
         if filter_mode == 'logit':
-            ls = compute_logit_scores(source_acts_clean, model.unembed.W_U, input_lengths)
+            pred_tokens = logits[
+                torch.arange(batch_size, device=device), input_lengths - 1
+            ].argmax(dim=-1)
+            ls = compute_logit_scores(
+                source_acts_clean, model.unembed.W_U, input_lengths, pred_tokens)
             scores_filt += ls.unsqueeze(1).expand_as(scores_filt)
 
         del source_acts_clean
