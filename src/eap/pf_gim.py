@@ -359,6 +359,54 @@ def compute_proximity_scores(
     return importance.sum(dim=0)
 
 
+def compute_norm_scores(
+    contributions: Tensor,
+    input_lengths: Tensor,
+) -> Tensor:
+    """L1 norm of source contributions as importance proxy.
+
+    contributions: (batch, pos, n_src, d_model)
+    input_lengths: (batch,)
+
+    Returns: (n_src,) scores aggregated over batch and positions.
+    """
+    norms = torch.linalg.vector_norm(contributions, ord=1, dim=-1)
+
+    max_len = input_lengths.max()
+    mask = torch.arange(max_len, device=input_lengths.device, dtype=input_lengths.dtype
+                        ).expand(len(input_lengths), max_len) < input_lengths.unsqueeze(1)
+    norms = norms * mask.unsqueeze(-1)
+
+    norms = norms.sum(dim=1) / input_lengths.view(-1, 1)
+    return norms.sum(dim=0)
+
+
+def compute_cosine_scores(
+    contributions: Tensor,
+    reference: Tensor,
+    input_lengths: Tensor,
+) -> Tensor:
+    """Cosine similarity between contributions and reference (clamped >= 0).
+
+    contributions: (batch, pos, n_src, d_model)
+    reference: (batch, pos, d_model)
+    input_lengths: (batch,)
+
+    Returns: (n_src,) scores aggregated over batch and positions.
+    """
+    cos = torch.nn.functional.cosine_similarity(
+        contributions, reference.unsqueeze(2), dim=-1)
+    cos = torch.clamp(cos, min=0)
+
+    max_len = input_lengths.max()
+    mask = torch.arange(max_len, device=input_lengths.device, dtype=input_lengths.dtype
+                        ).expand(len(input_lengths), max_len) < input_lengths.unsqueeze(1)
+    cos = cos * mask.unsqueeze(-1)
+
+    cos = cos.sum(dim=1) / input_lengths.view(-1, 1)
+    return cos.sum(dim=0)
+
+
 # ---------------------------------------------------------------------------
 # Cache filter
 # ---------------------------------------------------------------------------

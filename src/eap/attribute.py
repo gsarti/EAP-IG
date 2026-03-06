@@ -12,7 +12,7 @@ from tqdm import tqdm
 from .utils import tokenize_plus, make_hooks_and_matrices, compute_mean_activations
 from .evaluate import evaluate_graph, evaluate_baseline
 from .graph import Graph
-from .pf_gim import compute_proximity_scores
+from .pf_gim import compute_proximity_scores, compute_norm_scores, compute_cosine_scores
 
 
 def _model_device(model: HookedTransformer):
@@ -424,17 +424,18 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
                       metric: Callable[[Tensor], Tensor],
                       use_gim_grad: bool = True,
                       filter_quantile: float = 0.35,
+                      filter_mode: Literal['proximity', 'norm', 'cosine', 'random', 'none'] = 'proximity',
                       quiet: bool = False) -> torch.Tensor:
     """Gets scores using PF-GIM: Proximity-Filtered GIM.
 
     Computes GIM-corrected gradient scores (activation_diff × GIM_grad) for all
-    edges, then filters out structurally implausible edges using ALTI proximity.
-    Edges with proximity below a quantile threshold are zeroed out. Gradient
-    provides ranking, proximity provides structural plausibility filtering.
+    edges, then filters out structurally implausible edges using a structural
+    heuristic. Edges with heuristic score below a quantile threshold are zeroed
+    out. Gradient provides ranking, the heuristic provides structural filtering.
 
     Uses a 2-pass hook-based approach:
       Pass 1 (corrupted, inference mode): fills activation differences via hooks
-      Pass 2 (clean, forward+backward): computes proximity in forward hooks,
+      Pass 2 (clean, forward+backward): computes filter scores in forward hooks,
         gradient scores in backward hooks
 
     Args:
@@ -443,7 +444,13 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
         dataloader: the data over which to attribute
         metric: the metric to attribute w.r.t.
         use_gim_grad: use GIM-corrected gradients (frozen LN, TSG softmax, Shapley)
-        filter_quantile: quantile threshold for proximity filtering (default 0.35)
+        filter_quantile: quantile threshold for filtering (default 0.35)
+        filter_mode: structural heuristic for filtering:
+            'proximity' - ALTI proximity (default)
+            'norm' - L1 norm of source contributions
+            'cosine' - cosine similarity to destination residual
+            'random' - random scores (control)
+            'none' - no filtering (pure gradient)
         quiet: suppress tqdm output
 
     Returns:
@@ -452,10 +459,10 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
     device = _model_device(model)
     n_layers = graph.cfg['n_layers']
     n_heads = graph.cfg['n_heads']
-    parallel = model.cfg.parallel_attn_mlp
+    needs_filter_scores = filter_mode not in ('none', 'random')
 
     scores_grad = torch.zeros((graph.n_forward, graph.n_backward), device=device, dtype=model.cfg.dtype)
-    scores_prox = torch.zeros_like(scores_grad)
+    scores_prox = torch.zeros_like(scores_grad) if needs_filter_scores else None
 
     total_items = 0
     dataloader_iter = dataloader if quiet else tqdm(dataloader)
@@ -469,7 +476,8 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
         activation_difference = torch.zeros(
             (batch_size, n_pos, graph.n_forward, model.cfg.d_model),
             device=device, dtype=model.cfg.dtype)
-        source_acts_clean = torch.zeros_like(activation_difference)
+        source_acts_clean = (torch.zeros_like(activation_difference)
+                             if needs_filter_scores else None)
 
         # Position mask for input_lengths masking in backward hooks
         position_mask = (torch.arange(n_pos, device=device).expand(batch_size, n_pos)
@@ -482,15 +490,21 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
         def clean_source_hook(fwd_index, activations, hook):
             acts = activations.detach()
             activation_difference[:, :, fwd_index] -= acts
-            source_acts_clean[:, :, fwd_index] = acts
+            if source_acts_clean is not None:
+                source_acts_clean[:, :, fwd_index] = acts
 
         def dest_fwd_hook(prev_index, bwd_index, is_attn, activations, hook):
-            """Compute proximity scores during clean forward pass."""
+            """Compute filter scores during clean forward pass."""
             ref = activations.detach()
             if ref.ndim == 4:  # split QKV: (batch, pos, n_heads, d_model)
                 ref = ref[:, :, 0, :]
-            ep = compute_proximity_scores(
-                source_acts_clean[:, :, :prev_index], ref, input_lengths)
+            contribs = source_acts_clean[:, :, :prev_index]
+            if filter_mode == 'proximity':
+                ep = compute_proximity_scores(contribs, ref, input_lengths)
+            elif filter_mode == 'norm':
+                ep = compute_norm_scores(contribs, input_lengths)
+            elif filter_mode == 'cosine':
+                ep = compute_cosine_scores(contribs, ref, input_lengths)
             if is_attn:
                 scores_prox[:prev_index, bwd_index] += ep.unsqueeze(1).expand_as(
                     scores_prox[:prev_index, bwd_index])
@@ -539,8 +553,9 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
             if prev_index_attn > 0:
                 for i, letter in enumerate('qkv'):
                     bwd_index = graph.backward_index(attn_node, qkv=letter)
-                    fwd_hooks_clean.append((attn_node.qkv_inputs[i],
-                                            partial(dest_fwd_hook, prev_index_attn, bwd_index, True)))
+                    if needs_filter_scores:
+                        fwd_hooks_clean.append((attn_node.qkv_inputs[i],
+                                                partial(dest_fwd_hook, prev_index_attn, bwd_index, True)))
                     bwd_hooks.append((attn_node.qkv_inputs[i],
                                       partial(dest_bwd_hook, prev_index_attn, bwd_index)))
 
@@ -554,8 +569,9 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
 
             # MLP destination hooks — fire after attn source, before MLP source
             if prev_index_mlp > 0:
-                fwd_hooks_clean.append((mlp_node.in_hook,
-                                        partial(dest_fwd_hook, prev_index_mlp, bwd_index_mlp, False)))
+                if needs_filter_scores:
+                    fwd_hooks_clean.append((mlp_node.in_hook,
+                                            partial(dest_fwd_hook, prev_index_mlp, bwd_index_mlp, False)))
                 bwd_hooks.append((mlp_node.in_hook,
                                   partial(dest_bwd_hook, prev_index_mlp, bwd_index_mlp)))
 
@@ -567,8 +583,9 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
         logit_node = graph.nodes['logits']
         prev_index_logits = graph.prev_index(logit_node)
         bwd_index_logits = graph.backward_index(logit_node)
-        fwd_hooks_clean.append((logit_node.in_hook,
-                                partial(dest_fwd_hook, prev_index_logits, bwd_index_logits, False)))
+        if needs_filter_scores:
+            fwd_hooks_clean.append((logit_node.in_hook,
+                                    partial(dest_fwd_hook, prev_index_logits, bwd_index_logits, False)))
         bwd_hooks.append((logit_node.in_hook,
                           partial(dest_bwd_hook, prev_index_logits, bwd_index_logits)))
 
@@ -577,7 +594,7 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
             with model.hooks(fwd_hooks=fwd_hooks_corrupted):
                 model(corrupted_tokens, attention_mask=attention_mask)
 
-        # --- Pass 2: Clean forward (source acts + proximity) + backward (gradient scores) ---
+        # --- Pass 2: Clean forward (source acts + filter scores) + backward (gradient scores) ---
         gim_ctx = nullcontext()
         if use_gim_grad:
             import gim
@@ -591,13 +608,22 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
                 metric_value.backward()
 
         model.zero_grad()
-        del activation_difference, source_acts_clean
+        del activation_difference
+        if source_acts_clean is not None:
+            del source_acts_clean
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # --- Proximity-filtered gradient scores ---
+    # --- Apply filter ---
     scores_grad /= total_items
-    scores_prox /= total_items
+
+    if filter_mode == 'none':
+        return scores_grad
+
+    if filter_mode == 'random':
+        scores_prox = torch.rand_like(scores_grad)
+    else:
+        scores_prox /= total_items
 
     prox_flat = scores_prox[scores_prox > 0]
     if prox_flat.numel() > 0:
@@ -649,7 +675,8 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
               method: Literal['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'PF-GIM', 'GIM', 'exact'],
               intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', aggregation='sum',
               ig_steps: Optional[int]=None, intervention_dataloader: Optional[DataLoader]=None, quiet=False,
-              pf_gim_use_gim_grad: bool = True, pf_gim_filter_quantile: float = 0.35):
+              pf_gim_use_gim_grad: bool = True, pf_gim_filter_quantile: float = 0.35,
+              pf_gim_filter_mode: Literal['proximity', 'norm', 'cosine', 'random', 'none'] = 'proximity'):
     assert model.cfg.use_attn_result, "Model must be configured to use attention result (model.cfg.use_attn_result)"
     assert model.cfg.use_split_qkv_input, "Model must be configured to use split qkv inputs (model.cfg.use_split_qkv_input)"
     assert model.cfg.use_hook_mlp_in, "Model must be configured to use hook MLP in (model.cfg.use_hook_mlp_in)"
@@ -681,6 +708,7 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
         scores = get_scores_pf_gim(model, graph, dataloader, metric=metric,
                                    use_gim_grad=pf_gim_use_gim_grad,
                                    filter_quantile=pf_gim_filter_quantile,
+                                   filter_mode=pf_gim_filter_mode,
                                    quiet=quiet)
     elif method == 'GIM':
         scores = get_scores_gim(model, graph, dataloader, metric, quiet=quiet)
