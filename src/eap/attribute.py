@@ -425,8 +425,12 @@ def get_scores_information_flow_routes(model: HookedTransformer, graph: Graph, d
 
 def get_scores_gwai(model: HookedTransformer, graph: Graph, dataloader: DataLoader,
                     metric: Callable[[Tensor], Tensor],
-                    scoring: Literal['combined', 'gradient', 'proximity'] = 'combined',
+                    scoring: Literal['combined', 'gradient', 'proximity', 'additive', 'filtered'] = 'combined',
                     incremental: bool = True,
+                    use_gim_grad: bool = True,
+                    proximity_norm: Literal['sum', 'max'] = 'max',
+                    alpha: float = 0.7,
+                    filter_quantile: float = 0.5,
                     tsg_temperature: float = 2.0, scale_multiplicative: bool = True,
                     chunk_size: int = 8, quiet: bool = False) -> torch.Tensor:
     """Gets scores using GWAI: Gradient-Weighted ALTI Interactions.
@@ -436,24 +440,29 @@ def get_scores_gwai(model: HookedTransformer, graph: Graph, dataloader: DataLoad
     When incremental=True, activation differences are propagated through each
     layer via GIM-corrected JVPs, accounting for self-repair effects.
 
-    Three scoring modes:
-      - 'combined' (default): proximity-weighted counterfactual gradient projection.
-        score_j = proximity(z_j^clean, y^clean) × ((z_j^corr - z_j^clean) · grad).
-        Edges must be both structurally important (ALTI) AND task-relevant (gradient).
+    Scoring modes:
       - 'gradient': counterfactual gradient projection ((z_j^corr - z_j^clean) · grad).
       - 'proximity': ALTI proximity metric (geometric, task-agnostic, no corrupted pass).
-
-    When incremental=False, no JVP propagation is done. For proximity-only mode
-    this gives standard ALTI. For gradient/combined modes, raw activation diffs
-    are used without propagation.
+      - 'combined': proximity-weighted gradient. Uses proximity_norm to control how
+        proximity weights are normalized ('max' recommended, 'sum' is ALTI default).
+      - 'additive': z-score normalized additive fusion.
+        score = α × z(gradient) + (1-α) × z(proximity). Both signals contribute
+        proportionally without one zeroing out the other.
+      - 'filtered': gradient scores masked by proximity threshold. Edges with
+        proximity below the filter_quantile are zeroed. Gradient provides
+        ranking, proximity provides structural plausibility filtering.
 
     Args:
         model: the model to attribute
         graph: the graph to attribute
         dataloader: the data over which to attribute
-        metric: the metric to attribute w.r.t. (needed for combined/gradient scoring)
-        scoring: 'combined', 'gradient', or 'proximity'
-        incremental: whether to propagate sources through layers via GIM JVPs
+        metric: the metric to attribute w.r.t. (needed for gradient-based scoring)
+        scoring: scoring mode (see above)
+        incremental: whether to propagate through layers via GIM JVPs
+        use_gim_grad: use GIM-corrected gradients (frozen LN, TSG softmax, Shapley)
+        proximity_norm: 'max' or 'sum' normalization for proximity in combined mode
+        alpha: gradient weight for additive mode (proximity weight = 1 - alpha)
+        filter_quantile: quantile threshold for filtered mode (0.5 = median)
         tsg_temperature: temperature for TSG softmax correction (default 2.0)
         scale_multiplicative: whether to apply Shapley /2 at multiplicative junctions
         chunk_size: number of source nodes to process simultaneously in JVP
@@ -465,12 +474,19 @@ def get_scores_gwai(model: HookedTransformer, graph: Graph, dataloader: DataLoad
     device = _model_device(model)
     scores = torch.zeros((graph.n_forward, graph.n_backward), device=device, dtype=model.cfg.dtype)
 
-    needs_grad = scoring in ('combined', 'gradient')
+    needs_grad = scoring in ('combined', 'gradient', 'additive', 'filtered')
     needs_diff = needs_grad  # activation diffs needed for gradient-based scoring
+    needs_prox = scoring in ('combined', 'proximity', 'additive', 'filtered')
     names_filter = make_names_filter(model, needs_jvp=incremental)
     n_layers = graph.cfg['n_layers']
     n_heads = graph.cfg['n_heads']
     parallel = model.cfg.parallel_attn_mlp
+
+    # For additive/filtered modes, accumulate gradient and proximity scores separately
+    scores_grad = scores_prox = None
+    if scoring in ('additive', 'filtered'):
+        scores_grad = torch.zeros_like(scores)
+        scores_prox = torch.zeros_like(scores)
 
     total_items = 0
     dataloader_iter = dataloader if quiet else tqdm(dataloader)
@@ -519,11 +535,19 @@ def get_scores_gwai(model: HookedTransformer, graph: Graph, dataloader: DataLoad
             logit_node = graph.nodes['logits']
             fwd_hooks.append((logit_node.in_hook, make_save_hook('logits')))
 
-            with model.hooks(fwd_hooks=fwd_hooks):
-                logits = model(clean_tokens, attention_mask=attention_mask)
-                clean_logits = logits.detach()
-                metric_value = metric(logits, clean_logits, input_lengths, label)
-                metric_value.backward()
+            def _run_backward():
+                with model.hooks(fwd_hooks=fwd_hooks):
+                    logits = model(clean_tokens, attention_mask=attention_mask)
+                    clean_logits = logits.detach()
+                    metric_value = metric(logits, clean_logits, input_lengths, label)
+                    metric_value.backward()
+
+            if use_gim_grad:
+                import gim
+                with gim.GIM(model):
+                    _run_backward()
+            else:
+                _run_backward()
 
             for key, act in saved_acts.items():
                 if act.grad is not None:
@@ -554,51 +578,75 @@ def get_scores_gwai(model: HookedTransformer, graph: Graph, dataloader: DataLoad
             del corrupted_cache
 
         # --- Incremental scoring ---
+        def _add_to_scores(target, prev_idx, bwd_idx, edge_scores, is_attn=False):
+            """Add edge scores to the target tensor, broadcasting for attention."""
+            if is_attn:
+                if edge_scores.ndim == 1:
+                    target[:prev_idx, bwd_idx] += edge_scores.unsqueeze(1).expand(-1, n_heads)
+                else:
+                    target[:prev_idx, bwd_idx] += edge_scores
+            else:
+                target[:prev_idx, bwd_idx] += edge_scores
+
+        def _compute_grad_and_prox(prev_idx, grad_key, ref):
+            """Compute gradient and proximity scores for additive/filtered modes."""
+            eg = compute_edge_gradient_scores(
+                source_acts_diff[:, :, :prev_idx], grad_at[grad_key], input_lengths)
+            ep = compute_proximity_scores(
+                source_acts_clean[:, :, :prev_idx], ref, input_lengths)
+            return eg, ep
+
         def _score_attn_dest(layer, letter, prev_idx):
             """Score sources -> attention Q/K/V destination."""
             attn_n = graph.nodes[f'a{layer}.h0']
             key = (layer, letter)
             bwd_idx = graph.backward_index(attn_n, qkv=letter)
-            if scoring == 'combined' and key in grad_at:
-                ref = cache[f'blocks.{layer}.hook_resid_pre']
+            ref = cache[f'blocks.{layer}.hook_resid_pre']
+
+            if scoring in ('additive', 'filtered') and key in grad_at:
+                eg, ep = _compute_grad_and_prox(prev_idx, key, ref)
+                _add_to_scores(scores_grad, prev_idx, bwd_idx, eg, is_attn=True)
+                _add_to_scores(scores_prox, prev_idx, bwd_idx, ep, is_attn=True)
+            elif scoring == 'combined' and key in grad_at:
                 edge_scores = compute_combined_scores(
                     source_acts_clean[:, :, :prev_idx],
                     source_acts_diff[:, :, :prev_idx],
-                    ref, grad_at[key], input_lengths)
+                    ref, grad_at[key], input_lengths, proximity_norm=proximity_norm)
+                _add_to_scores(scores, prev_idx, bwd_idx, edge_scores, is_attn=True)
             elif scoring == 'gradient' and key in grad_at:
                 edge_scores = compute_edge_gradient_scores(
                     source_acts_diff[:, :, :prev_idx], grad_at[key], input_lengths)
-            else:
-                ref = cache[f'blocks.{layer}.hook_resid_pre']
+                _add_to_scores(scores, prev_idx, bwd_idx, edge_scores, is_attn=True)
+            else:  # proximity
                 importance = compute_proximity_scores(
                     source_acts_clean[:, :, :prev_idx], ref, input_lengths)
-                scores[:prev_idx, bwd_idx] += importance.unsqueeze(1).expand(-1, n_heads)
-                return
-            if edge_scores.ndim == 1:
-                scores[:prev_idx, bwd_idx] += edge_scores.unsqueeze(1).expand(-1, n_heads)
-            else:
-                scores[:prev_idx, bwd_idx] += edge_scores
+                _add_to_scores(scores, prev_idx, bwd_idx, importance, is_attn=True)
 
         def _score_mlp_dest(layer, prev_idx):
             """Score sources -> MLP destination."""
             mlp_n = graph.nodes[f'm{layer}']
             bwd_idx = graph.backward_index(mlp_n)
-            if scoring == 'combined' and (layer, 'mlp') in grad_at:
-                ref = (cache[f'blocks.{layer}.hook_resid_mid'] if not parallel
-                       else cache[f'blocks.{layer}.hook_resid_pre'])
+            ref = (cache[f'blocks.{layer}.hook_resid_mid'] if not parallel
+                   else cache[f'blocks.{layer}.hook_resid_pre'])
+
+            if scoring in ('additive', 'filtered') and (layer, 'mlp') in grad_at:
+                eg, ep = _compute_grad_and_prox(prev_idx, (layer, 'mlp'), ref)
+                scores_grad[:prev_idx, bwd_idx] += eg
+                scores_prox[:prev_idx, bwd_idx] += ep
+            elif scoring == 'combined' and (layer, 'mlp') in grad_at:
                 edge_scores = compute_combined_scores(
                     source_acts_clean[:, :, :prev_idx],
                     source_acts_diff[:, :, :prev_idx],
-                    ref, grad_at[(layer, 'mlp')], input_lengths)
+                    ref, grad_at[(layer, 'mlp')], input_lengths, proximity_norm=proximity_norm)
+                scores[:prev_idx, bwd_idx] += edge_scores
             elif scoring == 'gradient' and (layer, 'mlp') in grad_at:
                 edge_scores = compute_edge_gradient_scores(
                     source_acts_diff[:, :, :prev_idx], grad_at[(layer, 'mlp')], input_lengths)
-            else:
-                ref = (cache[f'blocks.{layer}.hook_resid_mid'] if not parallel
-                       else cache[f'blocks.{layer}.hook_resid_pre'])
+                scores[:prev_idx, bwd_idx] += edge_scores
+            else:  # proximity
                 edge_scores = compute_proximity_scores(
                     source_acts_clean[:, :, :prev_idx], ref, input_lengths)
-            scores[:prev_idx, bwd_idx] += edge_scores
+                scores[:prev_idx, bwd_idx] += edge_scores
 
         for layer in range(n_layers):
             attn_node = graph.nodes[f'a{layer}.h0']
@@ -646,29 +694,52 @@ def get_scores_gwai(model: HookedTransformer, graph: Graph, dataloader: DataLoad
         # --- Logits destination ---
         logit_node = graph.nodes['logits']
         prev_index_logits = graph.prev_index(logit_node)
+        bwd_idx_logits = graph.backward_index(logit_node)
+        ref_logits = cache[f'blocks.{n_layers - 1}.hook_resid_post']
 
-        if scoring == 'combined' and 'logits' in grad_at:
-            ref_logits = cache[f'blocks.{n_layers - 1}.hook_resid_post']
+        if scoring in ('additive', 'filtered') and 'logits' in grad_at:
+            eg, ep = _compute_grad_and_prox(prev_index_logits, 'logits', ref_logits)
+            scores_grad[:prev_index_logits, bwd_idx_logits] += eg
+            scores_prox[:prev_index_logits, bwd_idx_logits] += ep
+        elif scoring == 'combined' and 'logits' in grad_at:
             importance_logits = compute_combined_scores(
                 source_acts_clean[:, :, :prev_index_logits],
                 source_acts_diff[:, :, :prev_index_logits],
-                ref_logits, grad_at['logits'], input_lengths)
+                ref_logits, grad_at['logits'], input_lengths, proximity_norm=proximity_norm)
+            scores[:prev_index_logits, bwd_idx_logits] += importance_logits
         elif scoring == 'gradient' and 'logits' in grad_at:
             importance_logits = compute_edge_gradient_scores(
                 source_acts_diff[:, :, :prev_index_logits], grad_at['logits'], input_lengths)
-        else:
-            ref_logits = cache[f'blocks.{n_layers - 1}.hook_resid_post']
+            scores[:prev_index_logits, bwd_idx_logits] += importance_logits
+        else:  # proximity
             importance_logits = compute_proximity_scores(
                 source_acts_clean[:, :, :prev_index_logits], ref_logits, input_lengths)
-
-        bwd_idx_logits = graph.backward_index(logit_node)
-        scores[:prev_index_logits, bwd_idx_logits] += importance_logits
+            scores[:prev_index_logits, bwd_idx_logits] += importance_logits
 
         del cache, source_acts_clean
         if source_acts_diff is not None:
             del source_acts_diff
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    # --- Post-processing for additive/filtered modes ---
+    if scoring in ('additive', 'filtered'):
+        scores_grad /= total_items
+        scores_prox /= total_items
+
+        if scoring == 'additive':
+            # z-score normalize each signal, then combine
+            g_scale = scores_grad.abs().mean().clamp(min=1e-10)
+            p_scale = scores_prox.abs().mean().clamp(min=1e-10)
+            return alpha * (scores_grad / g_scale) + (1 - alpha) * (scores_prox / p_scale)
+        else:  # filtered
+            # Zero out gradient scores where proximity is below threshold
+            prox_flat = scores_prox[scores_prox > 0]
+            if prox_flat.numel() > 0:
+                threshold = torch.quantile(prox_flat, filter_quantile)
+                mask = scores_prox >= threshold
+                return scores_grad * mask
+            return scores_grad
 
     scores /= total_items
     return scores
@@ -717,6 +788,9 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
               intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', aggregation='sum',
               ig_steps: Optional[int]=None, intervention_dataloader: Optional[DataLoader]=None, quiet=False,
               gwai_scoring: str = 'combined', gwai_incremental: bool = True,
+              gwai_use_gim_grad: bool = True,
+              gwai_proximity_norm: str = 'max', gwai_alpha: float = 0.7,
+              gwai_filter_quantile: float = 0.5,
               gwai_tsg_temperature: float = 2.0, gwai_scale_multiplicative: bool = True,
               gwai_chunk_size: int = 8):
     assert model.cfg.use_attn_result, "Model must be configured to use attention result (model.cfg.use_attn_result)"
@@ -748,7 +822,10 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
         scores = get_scores_information_flow_routes(model, graph, dataloader, quiet=quiet)
     elif method == 'GWAI':
         scores = get_scores_gwai(model, graph, dataloader, metric=metric, scoring=gwai_scoring,
-                                 incremental=gwai_incremental, tsg_temperature=gwai_tsg_temperature,
+                                 incremental=gwai_incremental, use_gim_grad=gwai_use_gim_grad,
+                                 proximity_norm=gwai_proximity_norm, alpha=gwai_alpha,
+                                 filter_quantile=gwai_filter_quantile,
+                                 tsg_temperature=gwai_tsg_temperature,
                                  scale_multiplicative=gwai_scale_multiplicative,
                                  chunk_size=gwai_chunk_size, quiet=quiet)
     elif method == 'GIM':

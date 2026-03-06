@@ -302,23 +302,43 @@ def _propagate_chunked_mlp(
 # Scoring functions
 # ---------------------------------------------------------------------------
 
+def _raw_proximity(
+    contributions: Tensor,
+    reference: Tensor,
+) -> Tensor:
+    """Compute raw (unnormalized) ALTI proximity per sample and position.
+
+    contributions: (batch, pos, n_src, d_model)
+    reference: (batch, pos, d_model)
+
+    Returns: (batch, pos, n_src) raw proximity values >= 0.
+    """
+    ref_unsq = reference.unsqueeze(2)
+    dist = torch.linalg.vector_norm(contributions - ref_unsq, ord=1, dim=-1)
+    ref_norm = torch.linalg.vector_norm(ref_unsq, ord=1, dim=-1)
+    return torch.clamp(-dist + ref_norm, min=0)
+
+
 def _proximity_per_sample(
     contributions: Tensor,
     reference: Tensor,
+    normalization: Literal['sum', 'max'] = 'sum',
 ) -> Tensor:
     """Compute normalized ALTI proximity per sample and position (no aggregation).
 
     contributions: (batch, pos, n_src, d_model)
     reference: (batch, pos, d_model)
+    normalization: 'sum' (ALTI default, weights sum to 1) or
+                   'max' (weights in [0, 1], divided by per-position max)
 
-    Returns: (batch, pos, n_src) normalized proximity weights (sum to 1 across sources).
+    Returns: (batch, pos, n_src) normalized proximity weights.
     """
-    ref_unsq = reference.unsqueeze(2)
-    dist = torch.linalg.vector_norm(contributions - ref_unsq, ord=1, dim=-1)
-    ref_norm = torch.linalg.vector_norm(ref_unsq, ord=1, dim=-1)
-    proximity = torch.clamp(-dist + ref_norm, min=0)
-    prox_sum = proximity.sum(dim=2, keepdim=True).clamp(min=1e-10)
-    return proximity / prox_sum
+    proximity = _raw_proximity(contributions, reference)
+    if normalization == 'max':
+        denom = proximity.max(dim=2, keepdim=True).values.clamp(min=1e-10)
+    else:
+        denom = proximity.sum(dim=2, keepdim=True).clamp(min=1e-10)
+    return proximity / denom
 
 
 def _gradient_projection_per_sample(
@@ -384,6 +404,7 @@ def compute_combined_scores(
     reference: Tensor,
     grad: Tensor,
     input_lengths: Tensor,
+    proximity_norm: Literal['sum', 'max'] = 'max',
 ) -> Tensor:
     """Score edges by proximity-weighted gradient projection (GWAI).
 
@@ -398,10 +419,12 @@ def compute_combined_scores(
     reference: (batch, pos, d_model) — clean residual stream
     grad: (batch, pos, d_model) or (batch, pos, n_heads, d_model)
     input_lengths: (batch,)
+    proximity_norm: 'sum' (ALTI default) or 'max' (softer, recommended)
 
     Returns: (n_src,) or (n_src, n_heads)
     """
-    proximity = _proximity_per_sample(contributions_prox, reference)  # (batch, pos, n_src)
+    proximity = _proximity_per_sample(contributions_prox, reference,
+                                      normalization=proximity_norm)
     grad_proj = _gradient_projection_per_sample(contributions_grad, grad)
 
     per_head = grad.ndim == 4
