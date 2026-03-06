@@ -670,9 +670,173 @@ def get_scores_gim(model: HookedTransformer, graph: Graph, dataloader: DataLoade
                               quiet=quiet)
 
 
+def get_scores_gim_ig(model: HookedTransformer, graph: Graph, dataloader: DataLoader,
+                      metric: Callable[[Tensor], Tensor],
+                      steps: int = 5, quiet: bool = False) -> torch.Tensor:
+    """Gets edge attribution scores using GIM-IG: GIM-corrected integrated gradients.
+
+    Combines EAP-IG's integrated gradient interpolation with GIM's modified
+    backward pass (frozen LN, TSG softmax, Shapley normalization).
+
+    Args:
+        model: the model to attribute
+        graph: the graph to attribute
+        dataloader: the data over which to attribute
+        metric: the metric to attribute w.r.t.
+        steps: number of IG interpolation steps
+        quiet: suppress tqdm output
+
+    Returns:
+        Tensor: a [src_nodes, dst_nodes] tensor of scores for each edge
+    """
+    import gim
+
+    with gim.GIM(model):
+        return get_scores_eap_ig(model, graph, dataloader, metric, steps=steps, quiet=quiet)
+
+
+def _compute_filter_scores(
+    model: HookedTransformer, graph: Graph, dataloader: DataLoader,
+    filter_mode: Literal['proximity', 'norm', 'cosine'],
+    quiet: bool = False,
+) -> torch.Tensor:
+    """Compute structural filter scores via a single forward pass with hooks.
+
+    Runs clean inputs through the model and computes per-edge filter scores
+    (proximity, norm, or cosine) using forward hooks only.
+
+    Returns:
+        Tensor: a [src_nodes, dst_nodes] tensor of filter scores
+    """
+    device = _model_device(model)
+    n_layers = graph.cfg['n_layers']
+    n_heads = graph.cfg['n_heads']
+
+    scores_filt = torch.zeros((graph.n_forward, graph.n_backward), device=device, dtype=model.cfg.dtype)
+
+    total_items = 0
+    dataloader_iter = dataloader if quiet else tqdm(dataloader)
+    for clean, _, _ in dataloader_iter:
+        batch_size = len(clean)
+        total_items += batch_size
+        clean_tokens, attention_mask, input_lengths, n_pos = tokenize_plus(model, clean)
+
+        source_acts_clean = torch.zeros(
+            (batch_size, n_pos, graph.n_forward, model.cfg.d_model),
+            device=device, dtype=model.cfg.dtype)
+
+        def source_hook(fwd_index, activations, hook):
+            source_acts_clean[:, :, fwd_index] = activations.detach()
+
+        def dest_hook(prev_index, bwd_index, is_attn, activations, hook):
+            ref = activations.detach()
+            if ref.ndim == 4:
+                ref = ref[:, :, 0, :]
+            contribs = source_acts_clean[:, :, :prev_index]
+            if filter_mode == 'proximity':
+                ep = compute_proximity_scores(contribs, ref, input_lengths)
+            elif filter_mode == 'norm':
+                ep = compute_norm_scores(contribs, input_lengths)
+            elif filter_mode == 'cosine':
+                ep = compute_cosine_scores(contribs, ref, input_lengths)
+            if is_attn:
+                scores_filt[:prev_index, bwd_index] += ep.unsqueeze(1).expand_as(
+                    scores_filt[:prev_index, bwd_index])
+            else:
+                scores_filt[:prev_index, bwd_index] += ep
+
+        fwd_hooks = []
+        node = graph.nodes['input']
+        fwd_hooks.append((node.out_hook, partial(source_hook, graph.forward_index(node))))
+
+        for layer in range(n_layers):
+            attn_node = graph.nodes[f'a{layer}.h0']
+            prev_index_attn = graph.prev_index(attn_node)
+
+            if prev_index_attn > 0:
+                for i, letter in enumerate('qkv'):
+                    bwd_index = graph.backward_index(attn_node, qkv=letter)
+                    fwd_hooks.append((attn_node.qkv_inputs[i],
+                                      partial(dest_hook, prev_index_attn, bwd_index, True)))
+
+            fwd_hooks.append((attn_node.out_hook,
+                              partial(source_hook, graph.forward_index(attn_node))))
+
+            mlp_node = graph.nodes[f'm{layer}']
+            prev_index_mlp = graph.prev_index(mlp_node)
+            bwd_index_mlp = graph.backward_index(mlp_node)
+
+            if prev_index_mlp > 0:
+                fwd_hooks.append((mlp_node.in_hook,
+                                  partial(dest_hook, prev_index_mlp, bwd_index_mlp, False)))
+
+            fwd_hooks.append((mlp_node.out_hook,
+                              partial(source_hook, graph.forward_index(mlp_node, attn_slice=False))))
+
+        logit_node = graph.nodes['logits']
+        prev_index_logits = graph.prev_index(logit_node)
+        bwd_index_logits = graph.backward_index(logit_node)
+        fwd_hooks.append((logit_node.in_hook,
+                          partial(dest_hook, prev_index_logits, bwd_index_logits, False)))
+
+        with torch.inference_mode():
+            with model.hooks(fwd_hooks=fwd_hooks):
+                model(clean_tokens, attention_mask=attention_mask)
+
+        del source_acts_clean
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    scores_filt /= total_items
+    return scores_filt
+
+
+def get_scores_pf_gim_ig(model: HookedTransformer, graph: Graph, dataloader: DataLoader,
+                          metric: Callable[[Tensor], Tensor],
+                          filter_quantile: float = 0.35,
+                          filter_mode: Literal['proximity', 'norm', 'cosine', 'random', 'none'] = 'proximity',
+                          ig_steps: int = 5,
+                          quiet: bool = False) -> torch.Tensor:
+    """Gets scores using PF-GIM-IG: Proximity-filtered GIM-corrected integrated gradients.
+
+    Computes GIM-IG scores (EAP-IG with GIM-corrected backward pass), then
+    filters by a structural heuristic (proximity, norm, cosine, or random).
+
+    Args:
+        model: the model to attribute
+        graph: the graph to attribute
+        dataloader: the data over which to attribute
+        metric: the metric to attribute w.r.t.
+        filter_quantile: quantile threshold for filtering (default 0.35)
+        filter_mode: structural heuristic for filtering (default 'proximity')
+        ig_steps: number of IG interpolation steps (default 5)
+        quiet: suppress tqdm output
+
+    Returns:
+        Tensor: a [src_nodes, dst_nodes] tensor of scores for each edge
+    """
+    scores_grad = get_scores_gim_ig(model, graph, dataloader, metric,
+                                     steps=ig_steps, quiet=quiet)
+
+    if filter_mode == 'none':
+        return scores_grad
+
+    if filter_mode == 'random':
+        scores_prox = torch.rand_like(scores_grad)
+    else:
+        scores_prox = _compute_filter_scores(model, graph, dataloader, filter_mode, quiet)
+
+    prox_flat = scores_prox[scores_prox > 0]
+    if prox_flat.numel() > 0:
+        threshold = torch.quantile(prox_flat, filter_quantile)
+        mask = scores_prox >= threshold
+        return scores_grad * mask
+    return scores_grad
+
+
 allowed_aggregations = {'sum', 'mean'}
 def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor],
-              method: Literal['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'PF-GIM', 'GIM', 'exact'],
+              method: Literal['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'PF-GIM', 'GIM', 'GIM-IG', 'PF-GIM-IG', 'exact'],
               intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', aggregation='sum',
               ig_steps: Optional[int]=None, intervention_dataloader: Optional[DataLoader]=None, quiet=False,
               pf_gim_use_gim_grad: bool = True, pf_gim_filter_quantile: float = 0.35,
@@ -712,11 +876,19 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
                                    quiet=quiet)
     elif method == 'GIM':
         scores = get_scores_gim(model, graph, dataloader, metric, quiet=quiet)
+    elif method == 'GIM-IG':
+        scores = get_scores_gim_ig(model, graph, dataloader, metric, steps=ig_steps, quiet=quiet)
+    elif method == 'PF-GIM-IG':
+        scores = get_scores_pf_gim_ig(model, graph, dataloader, metric,
+                                       filter_quantile=pf_gim_filter_quantile,
+                                       filter_mode=pf_gim_filter_mode,
+                                       ig_steps=ig_steps if ig_steps is not None else 5,
+                                       quiet=quiet)
     elif method == 'exact':
         scores = get_scores_exact(model, graph, dataloader, metric, intervention=intervention, intervention_dataloader=intervention_dataloader,
                                   quiet=quiet)
     else:
-        raise ValueError(f"method must be in ['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'PF-GIM', 'GIM', 'exact'], but got {method}")
+        raise ValueError(f"method must be in ['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'PF-GIM', 'GIM', 'GIM-IG', 'PF-GIM-IG', 'exact'], but got {method}")
 
 
     if aggregation == 'mean':
