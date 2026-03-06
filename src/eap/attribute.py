@@ -12,7 +12,9 @@ from tqdm import tqdm
 from .utils import tokenize_plus, make_hooks_and_matrices, compute_mean_activations
 from .evaluate import evaluate_graph, evaluate_baseline
 from .graph import Graph
-from .pf_gim import compute_proximity_scores, compute_norm_scores, compute_cosine_scores, compute_logit_scores
+from .pf_gim import (compute_proximity_scores, compute_norm_scores, compute_cosine_scores,
+                      compute_logit_scores, compute_local_mixing_weights,
+                      compose_mixing_weights, compute_propagated_logit_scores)
 from .cdt import cd_edge_scores, cd_edge_scores_full
 
 
@@ -425,7 +427,7 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
                       metric: Callable[[Tensor], Tensor],
                       use_gim_grad: bool = True,
                       filter_quantile: float = 0.35,
-                      filter_mode: Literal['proximity', 'norm', 'cosine', 'logit', 'logit*proximity', 'random', 'none'] = 'proximity',
+                      filter_mode: Literal['proximity', 'norm', 'cosine', 'logit', 'logit*proximity', 'propagated_logit', 'random', 'none'] = 'proximity',
                       quiet: bool = False) -> torch.Tensor:
     """Gets scores using PF-GIM: Proximity-Filtered GIM.
 
@@ -452,6 +454,8 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
             'cosine' - cosine similarity to destination residual
             'logit' - logit-space importance via unembedding projection
             'logit*proximity' - product of logit and proximity scores
+            'propagated_logit' - ALTI-composed mixing weights × logit projection
+                (end-to-end importance accounting for dilution through layers)
             'random' - random scores (control)
             'none' - no filtering (pure gradient)
         quiet: suppress tqdm output
@@ -464,6 +468,7 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
     n_heads = graph.cfg['n_heads']
     needs_filter_scores = filter_mode not in ('none', 'random')
     needs_local_filter = filter_mode in ('proximity', 'norm', 'cosine', 'logit*proximity')
+    needs_mixing_hooks = filter_mode == 'propagated_logit'
 
     scores_grad = torch.zeros((graph.n_forward, graph.n_backward), device=device, dtype=model.cfg.dtype)
     scores_prox = torch.zeros_like(scores_grad) if needs_filter_scores else None
@@ -486,6 +491,9 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
         # Position mask for input_lengths masking in backward hooks
         position_mask = (torch.arange(n_pos, device=device).expand(batch_size, n_pos)
                          < input_lengths.unsqueeze(1))
+
+        # Per-destination local mixing data for propagated_logit composition
+        local_mixing = [] if needs_mixing_hooks else None
 
         # --- Hook definitions ---
         def corrupted_source_hook(fwd_index, activations, hook):
@@ -518,6 +526,15 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
                     scores_prox[:prev_index, bwd_index])
             else:
                 scores_prox[:prev_index, bwd_index] += ep
+
+        def dest_mixing_hook(fwd_key, prev_index, activations, hook):
+            """Capture local ALTI mixing weights for propagated_logit composition."""
+            ref = activations.detach()
+            if ref.ndim == 4:  # split QKV: take head 0
+                ref = ref[:, :, 0, :]
+            contribs = source_acts_clean[:, :, :prev_index]
+            weights = compute_local_mixing_weights(contribs, ref)
+            local_mixing.append((fwd_key, prev_index, weights))
 
         def dest_bwd_hook(prev_index, bwd_index, gradients, hook):
             """Compute gradient scores during backward pass."""
@@ -559,11 +576,17 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
 
             # Attention destination hooks (Q, K, V) — fire before attn source output
             if prev_index_attn > 0:
+                if needs_mixing_hooks:
+                    attn_fwd_slice = graph.forward_index(attn_node)
+                    attn_fwd_key = (attn_fwd_slice.start, attn_fwd_slice.stop)
                 for i, letter in enumerate('qkv'):
                     bwd_index = graph.backward_index(attn_node, qkv=letter)
                     if needs_local_filter:
                         fwd_hooks_clean.append((attn_node.qkv_inputs[i],
                                                 partial(dest_fwd_hook, prev_index_attn, bwd_index, True)))
+                    if needs_mixing_hooks:
+                        fwd_hooks_clean.append((attn_node.qkv_inputs[i],
+                                                partial(dest_mixing_hook, attn_fwd_key, prev_index_attn)))
                     bwd_hooks.append((attn_node.qkv_inputs[i],
                                       partial(dest_bwd_hook, prev_index_attn, bwd_index)))
 
@@ -580,6 +603,10 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
                 if needs_local_filter:
                     fwd_hooks_clean.append((mlp_node.in_hook,
                                             partial(dest_fwd_hook, prev_index_mlp, bwd_index_mlp, False)))
+                if needs_mixing_hooks:
+                    mlp_fwd_idx = graph.forward_index(mlp_node, attn_slice=False)
+                    fwd_hooks_clean.append((mlp_node.in_hook,
+                                            partial(dest_mixing_hook, mlp_fwd_idx, prev_index_mlp)))
                 bwd_hooks.append((mlp_node.in_hook,
                                   partial(dest_bwd_hook, prev_index_mlp, bwd_index_mlp)))
 
@@ -594,6 +621,9 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
         if needs_local_filter:
             fwd_hooks_clean.append((logit_node.in_hook,
                                     partial(dest_fwd_hook, prev_index_logits, bwd_index_logits, False)))
+        if needs_mixing_hooks:
+            fwd_hooks_clean.append((logit_node.in_hook,
+                                    partial(dest_mixing_hook, -1, prev_index_logits)))
         bwd_hooks.append((logit_node.in_hook,
                           partial(dest_bwd_hook, prev_index_logits, bwd_index_logits)))
 
@@ -630,6 +660,18 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
                 scores_prox += ls_expanded
             else:  # logit*proximity: proximity already accumulated, multiply by logit
                 scores_prox *= ls_expanded
+
+        # Propagated logit filter: ALTI-composed mixing weights × logit projection
+        if filter_mode == 'propagated_logit' and local_mixing:
+            composed = compose_mixing_weights(
+                local_mixing, graph.n_forward, batch_size, n_pos, device, model.cfg.dtype)
+            batch_idx = torch.arange(batch_size, device=device)
+            pred_tokens = clean_logits[batch_idx, input_lengths - 1].argmax(dim=-1)
+            foil_tokens = corrupted_logits[batch_idx, input_lengths - 1].argmax(dim=-1)
+            ps = compute_propagated_logit_scores(
+                source_acts_clean, composed, model.unembed.W_U,
+                input_lengths, pred_tokens, foil_tokens)
+            scores_prox += ps.unsqueeze(1).expand_as(scores_prox)
 
         del activation_difference
         if source_acts_clean is not None:
@@ -720,7 +762,7 @@ def get_scores_gim_ig(model: HookedTransformer, graph: Graph, dataloader: DataLo
 
 def _compute_filter_scores(
     model: HookedTransformer, graph: Graph, dataloader: DataLoader,
-    filter_mode: Literal['proximity', 'norm', 'cosine', 'logit', 'logit*proximity'],
+    filter_mode: Literal['proximity', 'norm', 'cosine', 'logit', 'logit*proximity', 'propagated_logit'],
     quiet: bool = False,
 ) -> torch.Tensor:
     """Compute structural filter scores via a single forward pass with hooks.
@@ -729,6 +771,8 @@ def _compute_filter_scores(
     using forward hooks only. For local filters (proximity, norm, cosine),
     scores are computed at each destination node. For the logit filter,
     scores are computed once per source via unembedding projection.
+    For propagated_logit, composes ALTI mixing weights across the graph
+    then projects through the unembedding for end-to-end importance.
 
     Returns:
         Tensor: a [src_nodes, dst_nodes] tensor of filter scores
@@ -736,12 +780,13 @@ def _compute_filter_scores(
     device = _model_device(model)
     n_layers = graph.cfg['n_layers']
     is_local_filter = filter_mode in ('proximity', 'norm', 'cosine', 'logit*proximity')
+    is_mixing_filter = filter_mode == 'propagated_logit'
 
     scores_filt = torch.zeros((graph.n_forward, graph.n_backward), device=device, dtype=model.cfg.dtype)
 
     total_items = 0
     dataloader_iter = dataloader if quiet else tqdm(dataloader)
-    needs_corrupted = filter_mode in ('logit', 'logit*proximity')
+    needs_corrupted = filter_mode in ('logit', 'logit*proximity', 'propagated_logit')
     for clean, corrupted, _ in dataloader_iter:
         batch_size = len(clean)
         total_items += batch_size
@@ -750,6 +795,8 @@ def _compute_filter_scores(
         source_acts_clean = torch.zeros(
             (batch_size, n_pos, graph.n_forward, model.cfg.d_model),
             device=device, dtype=model.cfg.dtype)
+
+        local_mixing = [] if is_mixing_filter else None
 
         def source_hook(fwd_index, activations, hook):
             source_acts_clean[:, :, fwd_index] = activations.detach()
@@ -773,6 +820,15 @@ def _compute_filter_scores(
             else:
                 scores_filt[:prev_index, bwd_index] += ep
 
+        def dest_mixing_hook_filt(fwd_key, prev_index, activations, hook):
+            """Capture local ALTI mixing weights for propagated_logit composition."""
+            ref = activations.detach()
+            if ref.ndim == 4:
+                ref = ref[:, :, 0, :]
+            contribs = source_acts_clean[:, :, :prev_index]
+            weights = compute_local_mixing_weights(contribs, ref)
+            local_mixing.append((fwd_key, prev_index, weights))
+
         fwd_hooks = []
         node = graph.nodes['input']
         fwd_hooks.append((node.out_hook, partial(source_hook, graph.forward_index(node))))
@@ -781,11 +837,18 @@ def _compute_filter_scores(
             attn_node = graph.nodes[f'a{layer}.h0']
             prev_index_attn = graph.prev_index(attn_node)
 
-            if prev_index_attn > 0 and is_local_filter:
-                for i, letter in enumerate('qkv'):
-                    bwd_index = graph.backward_index(attn_node, qkv=letter)
-                    fwd_hooks.append((attn_node.qkv_inputs[i],
-                                      partial(dest_hook, prev_index_attn, bwd_index, True)))
+            if prev_index_attn > 0:
+                if is_local_filter:
+                    for i, letter in enumerate('qkv'):
+                        bwd_index = graph.backward_index(attn_node, qkv=letter)
+                        fwd_hooks.append((attn_node.qkv_inputs[i],
+                                          partial(dest_hook, prev_index_attn, bwd_index, True)))
+                if is_mixing_filter:
+                    attn_fwd_slice = graph.forward_index(attn_node)
+                    attn_fwd_key = (attn_fwd_slice.start, attn_fwd_slice.stop)
+                    for i, letter in enumerate('qkv'):
+                        fwd_hooks.append((attn_node.qkv_inputs[i],
+                                          partial(dest_mixing_hook_filt, attn_fwd_key, prev_index_attn)))
 
             fwd_hooks.append((attn_node.out_hook,
                               partial(source_hook, graph.forward_index(attn_node))))
@@ -794,9 +857,14 @@ def _compute_filter_scores(
             prev_index_mlp = graph.prev_index(mlp_node)
             bwd_index_mlp = graph.backward_index(mlp_node)
 
-            if prev_index_mlp > 0 and is_local_filter:
-                fwd_hooks.append((mlp_node.in_hook,
-                                  partial(dest_hook, prev_index_mlp, bwd_index_mlp, False)))
+            if prev_index_mlp > 0:
+                if is_local_filter:
+                    fwd_hooks.append((mlp_node.in_hook,
+                                      partial(dest_hook, prev_index_mlp, bwd_index_mlp, False)))
+                if is_mixing_filter:
+                    mlp_fwd_idx = graph.forward_index(mlp_node, attn_slice=False)
+                    fwd_hooks.append((mlp_node.in_hook,
+                                      partial(dest_mixing_hook_filt, mlp_fwd_idx, prev_index_mlp)))
 
             fwd_hooks.append((mlp_node.out_hook,
                               partial(source_hook, graph.forward_index(mlp_node, attn_slice=False))))
@@ -807,6 +875,9 @@ def _compute_filter_scores(
         if is_local_filter:
             fwd_hooks.append((logit_node.in_hook,
                               partial(dest_hook, prev_index_logits, bwd_index_logits, False)))
+        if is_mixing_filter:
+            fwd_hooks.append((logit_node.in_hook,
+                              partial(dest_mixing_hook_filt, -1, prev_index_logits)))
 
         with torch.inference_mode():
             with model.hooks(fwd_hooks=fwd_hooks):
@@ -830,6 +901,21 @@ def _compute_filter_scores(
             else:  # logit*proximity
                 scores_filt *= ls_expanded
 
+        # Propagated logit filter: ALTI-composed mixing weights × logit projection
+        if filter_mode == 'propagated_logit' and local_mixing:
+            composed = compose_mixing_weights(
+                local_mixing, graph.n_forward, batch_size, n_pos, device, model.cfg.dtype)
+            batch_idx = torch.arange(batch_size, device=device)
+            pred_tokens = logits[batch_idx, input_lengths - 1].argmax(dim=-1)
+            corrupted_tokens, _, _, _ = tokenize_plus(model, corrupted)
+            with torch.inference_mode():
+                corrupted_logits = model(corrupted_tokens, attention_mask=attention_mask)
+            foil_tokens = corrupted_logits[batch_idx, input_lengths - 1].argmax(dim=-1)
+            ps = compute_propagated_logit_scores(
+                source_acts_clean, composed, model.unembed.W_U,
+                input_lengths, pred_tokens, foil_tokens)
+            scores_filt += ps.unsqueeze(1).expand_as(scores_filt)
+
         del source_acts_clean
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -841,7 +927,7 @@ def _compute_filter_scores(
 def get_scores_pf_gim_ig(model: HookedTransformer, graph: Graph, dataloader: DataLoader,
                           metric: Callable[[Tensor], Tensor],
                           filter_quantile: float = 0.35,
-                          filter_mode: Literal['proximity', 'norm', 'cosine', 'logit', 'logit*proximity', 'random', 'none'] = 'proximity',
+                          filter_mode: Literal['proximity', 'norm', 'cosine', 'logit', 'logit*proximity', 'propagated_logit', 'random', 'none'] = 'proximity',
                           ig_steps: int = 5,
                           quiet: bool = False) -> torch.Tensor:
     """Gets scores using PF-GIM-IG: Proximity-filtered GIM-corrected integrated gradients.
@@ -913,7 +999,7 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
               intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', aggregation='sum',
               ig_steps: Optional[int]=None, intervention_dataloader: Optional[DataLoader]=None, quiet=False,
               pf_gim_use_gim_grad: bool = True, pf_gim_filter_quantile: float = 0.35,
-              pf_gim_filter_mode: Literal['proximity', 'norm', 'cosine', 'logit', 'logit*proximity', 'random', 'none'] = 'proximity'):
+              pf_gim_filter_mode: Literal['proximity', 'norm', 'cosine', 'logit', 'logit*proximity', 'propagated_logit', 'random', 'none'] = 'proximity'):
     assert model.cfg.use_attn_result, "Model must be configured to use attention result (model.cfg.use_attn_result)"
     assert model.cfg.use_split_qkv_input, "Model must be configured to use split qkv inputs (model.cfg.use_split_qkv_input)"
     assert model.cfg.use_hook_mlp_in, "Model must be configured to use hook MLP in (model.cfg.use_hook_mlp_in)"
