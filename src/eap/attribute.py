@@ -617,7 +617,7 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
     # --- Apply filter ---
     scores_grad /= total_items
 
-    if filter_mode == 'none':
+    if filter_mode == 'none': # no filtering, return pure GIM gradient scores
         return scores_grad
 
     if filter_mode == 'random':
