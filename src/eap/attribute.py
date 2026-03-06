@@ -12,7 +12,7 @@ from tqdm import tqdm
 from .utils import tokenize_plus, make_hooks_and_matrices, compute_mean_activations
 from .evaluate import evaluate_graph, evaluate_baseline
 from .graph import Graph
-from .pf_gim import compute_proximity_scores, compute_norm_scores, compute_cosine_scores
+from .pf_gim import compute_proximity_scores, compute_norm_scores, compute_cosine_scores, compute_logit_scores
 
 
 def _model_device(model: HookedTransformer):
@@ -424,7 +424,7 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
                       metric: Callable[[Tensor], Tensor],
                       use_gim_grad: bool = True,
                       filter_quantile: float = 0.35,
-                      filter_mode: Literal['proximity', 'norm', 'cosine', 'random', 'none'] = 'proximity',
+                      filter_mode: Literal['proximity', 'norm', 'cosine', 'logit', 'random', 'none'] = 'proximity',
                       quiet: bool = False) -> torch.Tensor:
     """Gets scores using PF-GIM: Proximity-Filtered GIM.
 
@@ -449,6 +449,7 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
             'proximity' - ALTI proximity (default)
             'norm' - L1 norm of source contributions
             'cosine' - cosine similarity to destination residual
+            'logit' - logit-space importance via unembedding projection
             'random' - random scores (control)
             'none' - no filtering (pure gradient)
         quiet: suppress tqdm output
@@ -460,6 +461,7 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
     n_layers = graph.cfg['n_layers']
     n_heads = graph.cfg['n_heads']
     needs_filter_scores = filter_mode not in ('none', 'random')
+    needs_local_filter = filter_mode in ('proximity', 'norm', 'cosine')
 
     scores_grad = torch.zeros((graph.n_forward, graph.n_backward), device=device, dtype=model.cfg.dtype)
     scores_prox = torch.zeros_like(scores_grad) if needs_filter_scores else None
@@ -553,7 +555,7 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
             if prev_index_attn > 0:
                 for i, letter in enumerate('qkv'):
                     bwd_index = graph.backward_index(attn_node, qkv=letter)
-                    if needs_filter_scores:
+                    if needs_local_filter:
                         fwd_hooks_clean.append((attn_node.qkv_inputs[i],
                                                 partial(dest_fwd_hook, prev_index_attn, bwd_index, True)))
                     bwd_hooks.append((attn_node.qkv_inputs[i],
@@ -569,7 +571,7 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
 
             # MLP destination hooks — fire after attn source, before MLP source
             if prev_index_mlp > 0:
-                if needs_filter_scores:
+                if needs_local_filter:
                     fwd_hooks_clean.append((mlp_node.in_hook,
                                             partial(dest_fwd_hook, prev_index_mlp, bwd_index_mlp, False)))
                 bwd_hooks.append((mlp_node.in_hook,
@@ -583,7 +585,7 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
         logit_node = graph.nodes['logits']
         prev_index_logits = graph.prev_index(logit_node)
         bwd_index_logits = graph.backward_index(logit_node)
-        if needs_filter_scores:
+        if needs_local_filter:
             fwd_hooks_clean.append((logit_node.in_hook,
                                     partial(dest_fwd_hook, prev_index_logits, bwd_index_logits, False)))
         bwd_hooks.append((logit_node.in_hook,
@@ -608,6 +610,12 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
                 metric_value.backward()
 
         model.zero_grad()
+
+        # Logit filter: compute per-source scores via unembedding projection
+        if filter_mode == 'logit' and source_acts_clean is not None:
+            ls = compute_logit_scores(source_acts_clean, model.unembed.W_U, input_lengths)
+            scores_prox += ls.unsqueeze(1).expand_as(scores_prox)
+
         del activation_difference
         if source_acts_clean is not None:
             del source_acts_clean
@@ -697,20 +705,22 @@ def get_scores_gim_ig(model: HookedTransformer, graph: Graph, dataloader: DataLo
 
 def _compute_filter_scores(
     model: HookedTransformer, graph: Graph, dataloader: DataLoader,
-    filter_mode: Literal['proximity', 'norm', 'cosine'],
+    filter_mode: Literal['proximity', 'norm', 'cosine', 'logit'],
     quiet: bool = False,
 ) -> torch.Tensor:
     """Compute structural filter scores via a single forward pass with hooks.
 
     Runs clean inputs through the model and computes per-edge filter scores
-    (proximity, norm, or cosine) using forward hooks only.
+    using forward hooks only. For local filters (proximity, norm, cosine),
+    scores are computed at each destination node. For the logit filter,
+    scores are computed once per source via unembedding projection.
 
     Returns:
         Tensor: a [src_nodes, dst_nodes] tensor of filter scores
     """
     device = _model_device(model)
     n_layers = graph.cfg['n_layers']
-    n_heads = graph.cfg['n_heads']
+    is_local_filter = filter_mode in ('proximity', 'norm', 'cosine')
 
     scores_filt = torch.zeros((graph.n_forward, graph.n_backward), device=device, dtype=model.cfg.dtype)
 
@@ -753,7 +763,7 @@ def _compute_filter_scores(
             attn_node = graph.nodes[f'a{layer}.h0']
             prev_index_attn = graph.prev_index(attn_node)
 
-            if prev_index_attn > 0:
+            if prev_index_attn > 0 and is_local_filter:
                 for i, letter in enumerate('qkv'):
                     bwd_index = graph.backward_index(attn_node, qkv=letter)
                     fwd_hooks.append((attn_node.qkv_inputs[i],
@@ -766,7 +776,7 @@ def _compute_filter_scores(
             prev_index_mlp = graph.prev_index(mlp_node)
             bwd_index_mlp = graph.backward_index(mlp_node)
 
-            if prev_index_mlp > 0:
+            if prev_index_mlp > 0 and is_local_filter:
                 fwd_hooks.append((mlp_node.in_hook,
                                   partial(dest_hook, prev_index_mlp, bwd_index_mlp, False)))
 
@@ -776,12 +786,18 @@ def _compute_filter_scores(
         logit_node = graph.nodes['logits']
         prev_index_logits = graph.prev_index(logit_node)
         bwd_index_logits = graph.backward_index(logit_node)
-        fwd_hooks.append((logit_node.in_hook,
-                          partial(dest_hook, prev_index_logits, bwd_index_logits, False)))
+        if is_local_filter:
+            fwd_hooks.append((logit_node.in_hook,
+                              partial(dest_hook, prev_index_logits, bwd_index_logits, False)))
 
         with torch.inference_mode():
             with model.hooks(fwd_hooks=fwd_hooks):
                 model(clean_tokens, attention_mask=attention_mask)
+
+        # Logit filter: compute per-source scores via unembedding projection
+        if filter_mode == 'logit':
+            ls = compute_logit_scores(source_acts_clean, model.unembed.W_U, input_lengths)
+            scores_filt += ls.unsqueeze(1).expand_as(scores_filt)
 
         del source_acts_clean
         if torch.cuda.is_available():
@@ -794,7 +810,7 @@ def _compute_filter_scores(
 def get_scores_pf_gim_ig(model: HookedTransformer, graph: Graph, dataloader: DataLoader,
                           metric: Callable[[Tensor], Tensor],
                           filter_quantile: float = 0.35,
-                          filter_mode: Literal['proximity', 'norm', 'cosine', 'random', 'none'] = 'proximity',
+                          filter_mode: Literal['proximity', 'norm', 'cosine', 'logit', 'random', 'none'] = 'proximity',
                           ig_steps: int = 5,
                           quiet: bool = False) -> torch.Tensor:
     """Gets scores using PF-GIM-IG: Proximity-filtered GIM-corrected integrated gradients.
@@ -840,7 +856,7 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
               intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', aggregation='sum',
               ig_steps: Optional[int]=None, intervention_dataloader: Optional[DataLoader]=None, quiet=False,
               pf_gim_use_gim_grad: bool = True, pf_gim_filter_quantile: float = 0.35,
-              pf_gim_filter_mode: Literal['proximity', 'norm', 'cosine', 'random', 'none'] = 'proximity'):
+              pf_gim_filter_mode: Literal['proximity', 'norm', 'cosine', 'logit', 'random', 'none'] = 'proximity'):
     assert model.cfg.use_attn_result, "Model must be configured to use attention result (model.cfg.use_attn_result)"
     assert model.cfg.use_split_qkv_input, "Model must be configured to use split qkv inputs (model.cfg.use_split_qkv_input)"
     assert model.cfg.use_hook_mlp_in, "Model must be configured to use hook MLP in (model.cfg.use_hook_mlp_in)"

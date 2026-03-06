@@ -9,6 +9,8 @@ Scoring functions for the filtering heuristics:
   - compute_proximity_scores: ALTI proximity (default)
   - compute_norm_scores: L1 norm of source contributions
   - compute_cosine_scores: cosine similarity to destination residual
+  - compute_logit_scores: logit-space importance via unembedding projection
+    (Ferrando et al., ACL 2023)
 """
 
 import torch
@@ -92,3 +94,44 @@ def compute_cosine_scores(
 
     cos = cos.sum(dim=1) / input_lengths.view(-1, 1)
     return cos.sum(dim=0)
+
+
+def compute_logit_scores(
+    contributions: Tensor,
+    W_U: Tensor,
+    input_lengths: Tensor,
+    chunk_size: int = 8,
+) -> Tensor:
+    """Logit-space importance via unembedding projection at output position.
+
+    Projects each source's contribution at the output (last non-padding) position
+    through the unembedding matrix, then takes the L1 norm of the resulting logit
+    vector. Measures how much each source "votes" in logit space, following
+    Ferrando et al. (ACL 2023).
+
+    contributions: (batch, pos, n_src, d_model)
+    W_U: (d_model, d_vocab)
+    input_lengths: (batch,)
+    chunk_size: number of sources to project at once (controls peak memory)
+
+    Returns: (n_src,) scores aggregated over batch.
+    """
+    batch_size = contributions.shape[0]
+    n_src = contributions.shape[2]
+    device = contributions.device
+
+    # Get output position contributions: (batch, n_src, d_model)
+    output_idx = input_lengths - 1
+    output_contribs = contributions[
+        torch.arange(batch_size, device=device), output_idx
+    ]
+
+    # Process in chunks to avoid materializing (batch, n_src, d_vocab) at once
+    scores = torch.zeros(n_src, device=device, dtype=contributions.dtype)
+    for start in range(0, n_src, chunk_size):
+        end = min(start + chunk_size, n_src)
+        chunk = output_contribs[:, start:end]       # (batch, chunk, d_model)
+        logit_chunk = chunk @ W_U                    # (batch, chunk, d_vocab)
+        scores[start:end] = logit_chunk.abs().sum(dim=-1).sum(dim=0)
+
+    return scores
