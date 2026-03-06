@@ -1,5 +1,6 @@
 from typing import Callable, List, Optional, Literal, Tuple
 from functools import partial
+from contextlib import nullcontext
 
 import torch
 from torch.utils.data import DataLoader
@@ -11,11 +12,7 @@ from tqdm import tqdm
 from .utils import tokenize_plus, make_hooks_and_matrices, compute_mean_activations
 from .evaluate import evaluate_graph, evaluate_baseline
 from .graph import Graph
-from .pf_gim import (
-    compute_edge_gradient_scores,
-    compute_proximity_scores, make_names_filter,
-    _propagate_chunked_attention, _propagate_chunked_mlp,
-)
+from .pf_gim import compute_proximity_scores
 
 
 def _model_device(model: HookedTransformer):
@@ -427,15 +424,18 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
                       metric: Callable[[Tensor], Tensor],
                       use_gim_grad: bool = True,
                       filter_quantile: float = 0.35,
-                      incremental: bool = False,
-                      tsg_temperature: float = 2.0, scale_multiplicative: bool = True,
-                      chunk_size: int = 8, quiet: bool = False) -> torch.Tensor:
+                      quiet: bool = False) -> torch.Tensor:
     """Gets scores using PF-GIM: Proximity-Filtered GIM.
 
     Computes GIM-corrected gradient scores (activation_diff × GIM_grad) for all
     edges, then filters out structurally implausible edges using ALTI proximity.
     Edges with proximity below a quantile threshold are zeroed out. Gradient
     provides ranking, proximity provides structural plausibility filtering.
+
+    Uses a 2-pass hook-based approach:
+      Pass 1 (corrupted, inference mode): fills activation differences via hooks
+      Pass 2 (clean, forward+backward): computes proximity in forward hooks,
+        gradient scores in backward hooks
 
     Args:
         model: the model to attribute
@@ -444,17 +444,12 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
         metric: the metric to attribute w.r.t.
         use_gim_grad: use GIM-corrected gradients (frozen LN, TSG softmax, Shapley)
         filter_quantile: quantile threshold for proximity filtering (default 0.35)
-        incremental: whether to propagate through layers via GIM JVPs
-        tsg_temperature: temperature for TSG softmax correction (default 2.0)
-        scale_multiplicative: whether to apply Shapley /2 at multiplicative junctions
-        chunk_size: number of source nodes to process simultaneously in JVP
         quiet: suppress tqdm output
 
     Returns:
         Tensor: a [src_nodes, dst_nodes] tensor of scores for each edge
     """
     device = _model_device(model)
-    names_filter = make_names_filter(model, needs_jvp=incremental)
     n_layers = graph.cfg['n_layers']
     n_heads = graph.cfg['n_heads']
     parallel = model.cfg.parallel_attn_mlp
@@ -468,143 +463,135 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
         batch_size = len(clean)
         total_items += batch_size
         clean_tokens, attention_mask, input_lengths, n_pos = tokenize_plus(model, clean)
-
-        # --- Clean forward pass (full cache for JVPs and proximity) ---
-        with torch.inference_mode():
-            _, cache = model.run_with_cache(clean_tokens, attention_mask=attention_mask,
-                                            names_filter=names_filter)
-
-        # --- Corrupted forward pass (source outputs only) ---
         corrupted_tokens, _, _, _ = tokenize_plus(model, corrupted)
-        _src_hooks = {'hook_embed'}
-        for _l in range(n_layers):
-            _src_hooks.add(f'blocks.{_l}.attn.hook_result')
-            _src_hooks.add(f'blocks.{_l}.hook_mlp_out')
-        with torch.inference_mode():
-            _, corrupted_cache = model.run_with_cache(
-                corrupted_tokens, attention_mask=attention_mask,
-                names_filter=lambda name: name in _src_hooks)
 
-        # --- Compute task gradients at each destination input ---
-        grad_at = {}
-        saved_acts = {}
-        def make_save_hook(key):
-            def hook_fn(activations, hook):
-                activations.retain_grad()
-                saved_acts[key] = activations
-                return activations
-            return hook_fn
+        # Shared tensors filled by hooks
+        activation_difference = torch.zeros(
+            (batch_size, n_pos, graph.n_forward, model.cfg.d_model),
+            device=device, dtype=model.cfg.dtype)
+        source_acts_clean = torch.zeros_like(activation_difference)
 
-        fwd_hooks = []
+        # Position mask for input_lengths masking in backward hooks
+        position_mask = (torch.arange(n_pos, device=device).expand(batch_size, n_pos)
+                         < input_lengths.unsqueeze(1))
+
+        # --- Hook definitions ---
+        def corrupted_source_hook(fwd_index, activations, hook):
+            activation_difference[:, :, fwd_index] += activations.detach()
+
+        def clean_source_hook(fwd_index, activations, hook):
+            acts = activations.detach()
+            activation_difference[:, :, fwd_index] -= acts
+            source_acts_clean[:, :, fwd_index] = acts
+
+        def dest_fwd_hook(prev_index, bwd_index, is_attn, activations, hook):
+            """Compute proximity scores during clean forward pass."""
+            ref = activations.detach()
+            if ref.ndim == 4:  # split QKV: (batch, pos, n_heads, d_model)
+                ref = ref[:, :, 0, :]
+            ep = compute_proximity_scores(
+                source_acts_clean[:, :, :prev_index], ref, input_lengths)
+            if is_attn:
+                scores_prox[:prev_index, bwd_index] += ep.unsqueeze(1).expand_as(
+                    scores_prox[:prev_index, bwd_index])
+            else:
+                scores_prox[:prev_index, bwd_index] += ep
+
+        def dest_bwd_hook(prev_index, bwd_index, gradients, hook):
+            """Compute gradient scores during backward pass."""
+            grads = gradients.detach()
+            if grads.ndim == 3:
+                grads = grads.unsqueeze(2)
+            # Mask gradients to zero out padding positions
+            masked_grads = grads * position_mask.unsqueeze(-1).unsqueeze(-1)
+            s = torch.einsum('bpfh,bpkh->fk',
+                             activation_difference[:, :, :prev_index], masked_grads)
+            s = s.squeeze(-1)
+            scores_grad[:prev_index, bwd_index] += s
+
+        # --- Build corrupted hooks (source outputs only) ---
+        fwd_hooks_corrupted = []
+        node = graph.nodes['input']
+        fwd_hooks_corrupted.append((node.out_hook,
+                                    partial(corrupted_source_hook, graph.forward_index(node))))
+        for layer in range(n_layers):
+            node = graph.nodes[f'a{layer}.h0']
+            fwd_hooks_corrupted.append((node.out_hook,
+                                        partial(corrupted_source_hook, graph.forward_index(node))))
+            node = graph.nodes[f'm{layer}']
+            fwd_hooks_corrupted.append((node.out_hook,
+                                        partial(corrupted_source_hook, graph.forward_index(node, attn_slice=False))))
+
+        # --- Build clean forward + backward hooks ---
+        fwd_hooks_clean = []
+        bwd_hooks = []
+
+        # Embed source hook
+        node = graph.nodes['input']
+        fwd_hooks_clean.append((node.out_hook,
+                                partial(clean_source_hook, graph.forward_index(node))))
+
         for layer in range(n_layers):
             attn_node = graph.nodes[f'a{layer}.h0']
-            for i, letter in enumerate('qkv'):
-                hook_name = attn_node.qkv_inputs[i]
-                fwd_hooks.append((hook_name, make_save_hook((layer, letter))))
-            mlp_node = graph.nodes[f'm{layer}']
-            fwd_hooks.append((mlp_node.in_hook, make_save_hook((layer, 'mlp'))))
-        logit_node = graph.nodes['logits']
-        fwd_hooks.append((logit_node.in_hook, make_save_hook('logits')))
+            prev_index_attn = graph.prev_index(attn_node)
 
-        def _run_backward():
-            with model.hooks(fwd_hooks=fwd_hooks):
+            # Attention destination hooks (Q, K, V) — fire before attn source output
+            if prev_index_attn > 0:
+                for i, letter in enumerate('qkv'):
+                    bwd_index = graph.backward_index(attn_node, qkv=letter)
+                    fwd_hooks_clean.append((attn_node.qkv_inputs[i],
+                                            partial(dest_fwd_hook, prev_index_attn, bwd_index, True)))
+                    bwd_hooks.append((attn_node.qkv_inputs[i],
+                                      partial(dest_bwd_hook, prev_index_attn, bwd_index)))
+
+            # Attention source output hook
+            fwd_hooks_clean.append((attn_node.out_hook,
+                                    partial(clean_source_hook, graph.forward_index(attn_node))))
+
+            mlp_node = graph.nodes[f'm{layer}']
+            prev_index_mlp = graph.prev_index(mlp_node)
+            bwd_index_mlp = graph.backward_index(mlp_node)
+
+            # MLP destination hooks — fire after attn source, before MLP source
+            if prev_index_mlp > 0:
+                fwd_hooks_clean.append((mlp_node.in_hook,
+                                        partial(dest_fwd_hook, prev_index_mlp, bwd_index_mlp, False)))
+                bwd_hooks.append((mlp_node.in_hook,
+                                  partial(dest_bwd_hook, prev_index_mlp, bwd_index_mlp)))
+
+            # MLP source output hook
+            fwd_hooks_clean.append((mlp_node.out_hook,
+                                    partial(clean_source_hook, graph.forward_index(mlp_node, attn_slice=False))))
+
+        # Logits destination hooks
+        logit_node = graph.nodes['logits']
+        prev_index_logits = graph.prev_index(logit_node)
+        bwd_index_logits = graph.backward_index(logit_node)
+        fwd_hooks_clean.append((logit_node.in_hook,
+                                partial(dest_fwd_hook, prev_index_logits, bwd_index_logits, False)))
+        bwd_hooks.append((logit_node.in_hook,
+                          partial(dest_bwd_hook, prev_index_logits, bwd_index_logits)))
+
+        # --- Pass 1: Corrupted forward (fill activation_difference) ---
+        with torch.inference_mode():
+            with model.hooks(fwd_hooks=fwd_hooks_corrupted):
+                model(corrupted_tokens, attention_mask=attention_mask)
+
+        # --- Pass 2: Clean forward (source acts + proximity) + backward (gradient scores) ---
+        gim_ctx = nullcontext()
+        if use_gim_grad:
+            import gim
+            gim_ctx = gim.GIM(model)
+
+        with gim_ctx:
+            with model.hooks(fwd_hooks=fwd_hooks_clean, bwd_hooks=bwd_hooks):
                 logits = model(clean_tokens, attention_mask=attention_mask)
                 clean_logits = logits.detach()
                 metric_value = metric(logits, clean_logits, input_lengths, label)
                 metric_value.backward()
 
-        if use_gim_grad:
-            import gim
-            with gim.GIM(model):
-                _run_backward()
-        else:
-            _run_backward()
-
-        for key, act in saved_acts.items():
-            if act.grad is not None:
-                grad_at[key] = act.grad.detach()
         model.zero_grad()
-
-        # --- Build source activation tensors ---
-        def _build_source_acts(src_cache):
-            sa = torch.zeros((batch_size, n_pos, graph.n_forward, model.cfg.d_model),
-                             device=device, dtype=model.cfg.dtype)
-            sa[:, :, 0] = src_cache['hook_embed']
-            for _l in range(n_layers):
-                _an = graph.nodes[f'a{_l}.h0']
-                _fi = graph.forward_index(_an)
-                sa[:, :, _fi] = src_cache[f'blocks.{_l}.attn.hook_result']
-                _mn = graph.nodes[f'm{_l}']
-                _mi = graph.forward_index(_mn, attn_slice=False)
-                sa[:, :, _mi] = src_cache[f'blocks.{_l}.hook_mlp_out']
-            return sa
-
-        source_acts_clean = _build_source_acts(cache)
-        source_acts_diff = _build_source_acts(corrupted_cache) - source_acts_clean
-        del corrupted_cache
-
-        # --- Score each destination ---
-        def _add_to_scores(target, prev_idx, bwd_idx, edge_scores, is_attn=False):
-            if is_attn:
-                if edge_scores.ndim == 1:
-                    target[:prev_idx, bwd_idx] += edge_scores.unsqueeze(1).expand(-1, n_heads)
-                else:
-                    target[:prev_idx, bwd_idx] += edge_scores
-            else:
-                target[:prev_idx, bwd_idx] += edge_scores
-
-        def _score_dest(prev_idx, bwd_idx, grad_key, ref, is_attn=False):
-            if grad_key in grad_at:
-                eg = compute_edge_gradient_scores(
-                    source_acts_diff[:, :, :prev_idx], grad_at[grad_key], input_lengths)
-                _add_to_scores(scores_grad, prev_idx, bwd_idx, eg, is_attn=is_attn)
-            ep = compute_proximity_scores(
-                source_acts_clean[:, :, :prev_idx], ref, input_lengths)
-            _add_to_scores(scores_prox, prev_idx, bwd_idx, ep, is_attn=is_attn)
-
-        for layer in range(n_layers):
-            attn_node = graph.nodes[f'a{layer}.h0']
-            prev_index = graph.prev_index(attn_node)
-
-            if prev_index > 0:
-                ref = cache[f'blocks.{layer}.hook_resid_pre']
-                for letter in 'qkv':
-                    bwd_idx = graph.backward_index(attn_node, qkv=letter)
-                    _score_dest(prev_index, bwd_idx, (layer, letter), ref, is_attn=True)
-
-            if incremental:
-                n_src_before_attn = graph.prev_index(attn_node)
-                if n_src_before_attn > 0:
-                    with torch.inference_mode():
-                        source_acts_diff = _propagate_chunked_attention(
-                            source_acts_diff, n_src_before_attn, layer, model, cache,
-                            tsg_temperature, scale_multiplicative, chunk_size)
-
-            mlp_node = graph.nodes[f'm{layer}']
-            prev_index_mlp = graph.prev_index(mlp_node)
-
-            if prev_index_mlp > 0:
-                bwd_idx = graph.backward_index(mlp_node)
-                ref = (cache[f'blocks.{layer}.hook_resid_mid'] if not parallel
-                       else cache[f'blocks.{layer}.hook_resid_pre'])
-                _score_dest(prev_index_mlp, bwd_idx, (layer, 'mlp'), ref)
-
-            if incremental:
-                n_src_before_mlp = graph.prev_index(mlp_node)
-                if n_src_before_mlp > 0:
-                    with torch.inference_mode():
-                        source_acts_diff = _propagate_chunked_mlp(
-                            source_acts_diff, n_src_before_mlp, layer, model, cache,
-                            scale_multiplicative, chunk_size)
-
-        # --- Logits destination ---
-        logit_node = graph.nodes['logits']
-        prev_index_logits = graph.prev_index(logit_node)
-        bwd_idx_logits = graph.backward_index(logit_node)
-        ref_logits = cache[f'blocks.{n_layers - 1}.hook_resid_post']
-        _score_dest(prev_index_logits, bwd_idx_logits, 'logits', ref_logits)
-
-        del cache, source_acts_clean, source_acts_diff
+        del activation_difference, source_acts_clean
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -662,10 +649,7 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
               method: Literal['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'PF-GIM', 'GIM', 'exact'],
               intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', aggregation='sum',
               ig_steps: Optional[int]=None, intervention_dataloader: Optional[DataLoader]=None, quiet=False,
-              pf_gim_use_gim_grad: bool = True, pf_gim_filter_quantile: float = 0.35,
-              pf_gim_incremental: bool = False,
-              pf_gim_tsg_temperature: float = 2.0, pf_gim_scale_multiplicative: bool = True,
-              pf_gim_chunk_size: int = 8):
+              pf_gim_use_gim_grad: bool = True, pf_gim_filter_quantile: float = 0.35):
     assert model.cfg.use_attn_result, "Model must be configured to use attention result (model.cfg.use_attn_result)"
     assert model.cfg.use_split_qkv_input, "Model must be configured to use split qkv inputs (model.cfg.use_split_qkv_input)"
     assert model.cfg.use_hook_mlp_in, "Model must be configured to use hook MLP in (model.cfg.use_hook_mlp_in)"
@@ -697,10 +681,7 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
         scores = get_scores_pf_gim(model, graph, dataloader, metric=metric,
                                    use_gim_grad=pf_gim_use_gim_grad,
                                    filter_quantile=pf_gim_filter_quantile,
-                                   incremental=pf_gim_incremental,
-                                   tsg_temperature=pf_gim_tsg_temperature,
-                                   scale_multiplicative=pf_gim_scale_multiplicative,
-                                   chunk_size=pf_gim_chunk_size, quiet=quiet)
+                                   quiet=quiet)
     elif method == 'GIM':
         scores = get_scores_gim(model, graph, dataloader, metric, quiet=quiet)
     elif method == 'exact':
