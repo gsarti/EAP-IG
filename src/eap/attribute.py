@@ -13,6 +13,7 @@ from .utils import tokenize_plus, make_hooks_and_matrices, compute_mean_activati
 from .evaluate import evaluate_graph, evaluate_baseline
 from .graph import Graph
 from .pf_gim import compute_proximity_scores, compute_norm_scores, compute_cosine_scores, compute_logit_scores
+from .cdt import cd_edge_scores, cd_edge_scores_full
 
 
 def _model_device(model: HookedTransformer):
@@ -500,6 +501,8 @@ def get_scores_pf_gim(model: HookedTransformer, graph: Graph, dataloader: DataLo
             """Compute filter scores during clean forward pass."""
             ref = activations.detach()
             if ref.ndim == 4:  # split QKV: (batch, pos, n_heads, d_model)
+                # All heads receive the same resid_pre (repeat_along_head_dimension),
+                # so any head index gives the same reference — take head 0.
                 ref = ref[:, :, 0, :]
             contribs = source_acts_clean[:, :, :prev_index]
             if filter_mode in ('proximity', 'logit*proximity'):
@@ -753,7 +756,7 @@ def _compute_filter_scores(
 
         def dest_hook(prev_index, bwd_index, is_attn, activations, hook):
             ref = activations.detach()
-            if ref.ndim == 4:
+            if ref.ndim == 4:  # split QKV: all heads get same resid_pre
                 ref = ref[:, :, 0, :]
             contribs = source_acts_clean[:, :, :prev_index]
             if filter_mode in ('proximity', 'logit*proximity'):
@@ -878,9 +881,35 @@ def get_scores_pf_gim_ig(model: HookedTransformer, graph: Graph, dataloader: Dat
     return scores_grad
 
 
+def get_scores_cdt(model: HookedTransformer, graph: Graph, dataloader: DataLoader,
+                   metric: Callable[[Tensor], Tensor], full: bool = False,
+                   quiet: bool = False) -> torch.Tensor:
+    """CD-T: Contextual Decomposition edge-level scores (Hsu et al., 2024).
+
+    Args:
+        full: If False (default), use hook-based source extraction + CD propagation.
+              If True, use full CD-T decomposition with source marking in value space.
+    """
+    device = _model_device(model)
+    n_layers, n_heads = model.cfg.n_layers, model.cfg.n_heads
+    scores = torch.zeros(graph.n_forward, graph.n_backward, device=device)
+    score_fn = cd_edge_scores_full if full else cd_edge_scores
+
+    dataloader_iter = tqdm(dataloader, disable=quiet)
+    for clean, corrupted, _ in dataloader_iter:
+        tokens, attention_mask, input_lengths, n_pos = tokenize_plus(model, clean)
+        batch_scores = score_fn(
+            model, tokens, attention_mask, input_lengths,
+            graph.n_forward, graph.n_backward, n_layers, n_heads)
+        scores += batch_scores
+
+    graph.scores = scores
+    return scores
+
+
 allowed_aggregations = {'sum', 'mean'}
 def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, metric: Callable[[Tensor], Tensor],
-              method: Literal['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'PF-GIM', 'GIM', 'GIM-IG', 'PF-GIM-IG', 'exact'],
+              method: Literal['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'PF-GIM', 'GIM', 'GIM-IG', 'PF-GIM-IG', 'CD-T', 'CD-T-full', 'exact'],
               intervention: Literal['patching', 'zero', 'mean','mean-positional']='patching', aggregation='sum',
               ig_steps: Optional[int]=None, intervention_dataloader: Optional[DataLoader]=None, quiet=False,
               pf_gim_use_gim_grad: bool = True, pf_gim_filter_quantile: float = 0.35,
@@ -928,11 +957,15 @@ def attribute(model: HookedTransformer, graph: Graph, dataloader: DataLoader, me
                                        filter_mode=pf_gim_filter_mode,
                                        ig_steps=ig_steps if ig_steps is not None else 5,
                                        quiet=quiet)
+    elif method == 'CD-T':
+        scores = get_scores_cdt(model, graph, dataloader, metric, full=False, quiet=quiet)
+    elif method == 'CD-T-full':
+        scores = get_scores_cdt(model, graph, dataloader, metric, full=True, quiet=quiet)
     elif method == 'exact':
         scores = get_scores_exact(model, graph, dataloader, metric, intervention=intervention, intervention_dataloader=intervention_dataloader,
                                   quiet=quiet)
     else:
-        raise ValueError(f"method must be in ['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'PF-GIM', 'GIM', 'GIM-IG', 'PF-GIM-IG', 'exact'], but got {method}")
+        raise ValueError(f"method must be in ['EAP', 'EAP-IG-inputs', 'clean-corrupted', 'EAP-IG-activations', 'information-flow-routes', 'PF-GIM', 'GIM', 'GIM-IG', 'PF-GIM-IG', 'CD-T', 'CD-T-full', 'exact'], but got {method}")
 
 
     if aggregation == 'mean':
